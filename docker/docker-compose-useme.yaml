@@ -66,10 +66,14 @@ services:
   qdrant:
     image: langgenius/qdrant:v1.7.3
     restart: always
+    ports:
+      - "6333:6333"
     volumes:
       - qdrant_storage:/qdrant/storage
     environment:
       QDRANT_API_KEY: ${QDRANT_API_KEY:-difyai123456}
+    networks:
+      - default
 
   codebase-indexer:
     build:
@@ -82,11 +86,13 @@ services:
     environment:
       - QDRANT_URL=http://qdrant:6333
       - QDRANT_API_KEY=${QDRANT_API_KEY:-difyai123456}
+      - VOYAGE_API_KEY=${VOYAGE_API_KEY}
     depends_on:
       - qdrant
     ports:
       - "7779:7779"
-      - "1234:1234"
+    networks:
+      - default
 
   cli:
     build:
@@ -100,6 +106,8 @@ services:
       - API_URL=http://codebase-indexer:7779
     depends_on:
       - codebase-indexer
+    networks:
+      - default
 
   api:
     image: langgenius/dify-api:0.7.3
@@ -277,7 +285,6 @@ volumes:
 
 networks:
   ssrf_proxy_network:
-    driver: bridge
     internal: true
   default:
     driver: bridge

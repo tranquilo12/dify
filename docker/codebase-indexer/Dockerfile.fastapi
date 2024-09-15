@@ -9,4 +9,4 @@ COPY codebase-indexer/*.py .
 
 EXPOSE 7779
 
-CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port 7779 & python watcher.py"]
+CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port 7779"]
