@@ -16,3 +16,6 @@ pandas
 torch
 transformers
 sentence-transformers
+watchdog
+click
+pytest

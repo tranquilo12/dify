@@ -84,7 +84,7 @@ def initialize_qdrant(collection_names: List[str]) -> QdrantClient:
     QdrantClient
         Configured Qdrant client with an 'IntoTheDeep' collection.
     """
-    client = QdrantClient(":memory:")
+    client = QdrantClient(url="http://localhost:6333")
     for collection_name in collection_names:
         client.create_collection(
             collection_name=collection_name,
