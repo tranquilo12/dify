@@ -182,7 +182,7 @@ services:
       test: [ "CMD", "redis-cli", "ping" ]
 
   sandbox:
-    image: langgenius/dify-sandbox:0.2.6
+    image: langgenius/dify-sandbox:0.2.9
     restart: always
     environment:
       API_KEY: ${SANDBOX_API_KEY:-dify-sandbox}
