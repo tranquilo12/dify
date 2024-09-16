@@ -63,6 +63,51 @@ x-shared-env: &shared-api-worker-env
 
 services:
 
+  ###### DIFY stuff ######
+  api:
+    image: langgenius/dify-api:0.8.2
+    restart: always
+    environment:
+      <<: *shared-api-worker-env
+      MODE: api
+    depends_on:
+      - db
+      - redis
+      - qdrant
+      - codebase-indexer
+    volumes:
+      - ./volumes/app/storage:/app/api/storage
+    networks:
+      - ssrf_proxy_network
+      - default
+
+  worker:
+    image: langgenius/dify-api:0.8.2
+    restart: always
+    environment:
+      <<: *shared-api-worker-env
+      MODE: worker
+    depends_on:
+      - db
+      - redis
+      - qdrant
+      - codebase-indexer
+    volumes:
+      - ./volumes/app/storage:/app/api/storage
+    networks:
+      - ssrf_proxy_network
+      - default
+
+  web:
+    image: langgenius/dify-web:0.8.2
+    restart: always
+    environment:
+      CONSOLE_API_URL: ${CONSOLE_API_URL:-}
+      APP_API_URL: ${APP_API_URL:-}
+      SENTRY_DSN: ${WEB_SENTRY_DSN:-}
+      NEXT_TELEMETRY_DISABLED: ${NEXT_TELEMETRY_DISABLED:-0}
+
+  ###### Other stuff ######
   qdrant:
     image: langgenius/qdrant:v1.7.3
     restart: always
@@ -72,8 +117,6 @@ services:
       - qdrant_storage:/qdrant/storage
     environment:
       QDRANT_API_KEY: ${QDRANT_API_KEY:-difyai123456}
-    networks:
-      - default
 
   codebase-indexer:
     build:
@@ -91,8 +134,6 @@ services:
       - qdrant
     ports:
       - "7779:7779"
-    networks:
-      - default
 
   cli:
     build:
@@ -108,49 +149,6 @@ services:
       - codebase-indexer
     networks:
       - default
-
-  api:
-    image: langgenius/dify-api:0.7.3
-    restart: always
-    environment:
-      <<: *shared-api-worker-env
-      MODE: api
-    depends_on:
-      - db
-      - redis
-      - qdrant
-      - codebase-indexer
-    volumes:
-      - ./volumes/app/storage:/app/api/storage
-    networks:
-      - ssrf_proxy_network
-      - default
-
-  worker:
-    image: langgenius/dify-api:0.7.3
-    restart: always
-    environment:
-      <<: *shared-api-worker-env
-      MODE: worker
-    depends_on:
-      - db
-      - redis
-      - qdrant
-      - codebase-indexer
-    volumes:
-      - ./volumes/app/storage:/app/api/storage
-    networks:
-      - ssrf_proxy_network
-      - default
-
-  web:
-    image: langgenius/dify-web:0.7.3
-    restart: always
-    environment:
-      CONSOLE_API_URL: ${CONSOLE_API_URL:-}
-      APP_API_URL: ${APP_API_URL:-}
-      SENTRY_DSN: ${WEB_SENTRY_DSN:-}
-      NEXT_TELEMETRY_DISABLED: ${NEXT_TELEMETRY_DISABLED:-0}
 
   db:
     image: postgres:15-alpine
