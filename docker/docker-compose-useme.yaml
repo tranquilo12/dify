@@ -123,9 +123,8 @@ services:
       context: .
       dockerfile: codebase-indexer/Dockerfile.fastapi
     volumes:
-      - /Users/shriramsunder/Projects/IntoTheDeep:/app/codebase/IntoTheDeep
-      - /Users/shriramsunder/Projects/ParationalServices/ParationalAddOn/officeAddOn:/app/codebase/officeAddOn
-      - /Users/shriramsunder/Projects/LLMStuff/:/app/codebase/LLMStuff
+      - C:\Users\parationalTest\Projects\IntotheDeep:/app/codebase/IntotheDeep
+      - C:\Users\parationalTest\Projects\ParationalAddOn\officeAddOn:/app/codebase/officeAddOn
     environment:
       - QDRANT_URL=http://qdrant:6333
       - QDRANT_API_KEY=${QDRANT_API_KEY:-difyai123456}
@@ -140,9 +139,8 @@ services:
       context: .
       dockerfile: codebase-indexer/Dockerfile.cli
     volumes:
-      - /Users/shriramsunder/Projects/IntoTheDeep:/app/codebase/IntoTheDeep
-      - /Users/shriramsunder/Projects/ParationalServices/ParationalAddOn/officeAddOn:/app/codebase/officeAddOn
-      - /Users/shriramsunder/Projects/LLMStuff/:/app/codebase/LLMStuff
+      - C:\Users\parationalTest\Projects\IntotheDeep:/app/codebase/IntotheDeep
+      - C:\Users\parationalTest\Projects\ParationalAddOn\officeAddOn:/app/codebase/officeAddOn
     environment:
       - API_URL=http://codebase-indexer:7779
     depends_on:
