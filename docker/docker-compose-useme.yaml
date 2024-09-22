@@ -126,6 +126,7 @@ services:
       - /Users/shriramsunder/Projects/IntoTheDeep:/app/codebase/IntoTheDeep
       - /Users/shriramsunder/Projects/ParationalServices/ParationalAddOn/officeAddOn:/app/codebase/officeAddOn
       - /Users/shriramsunder/Projects/LLMStuff/:/app/codebase/LLMStuff
+      - /Users/shriramsunder/Projects/dify/docker/codebase-indexer:/app/codebase/codebase-indexer
     environment:
       - QDRANT_URL=http://qdrant:6333
       - QDRANT_API_KEY=${QDRANT_API_KEY:-difyai123456}
@@ -143,6 +144,7 @@ services:
       - /Users/shriramsunder/Projects/IntoTheDeep:/app/codebase/IntoTheDeep
       - /Users/shriramsunder/Projects/ParationalServices/ParationalAddOn/officeAddOn:/app/codebase/officeAddOn
       - /Users/shriramsunder/Projects/LLMStuff/:/app/codebase/LLMStuff
+      - /Users/shriramsunder/Projects/dify/docker/codebase-indexer:/app/codebase/codebase-indexer
     environment:
       - API_URL=http://codebase-indexer:7779
     depends_on:

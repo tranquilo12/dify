@@ -76,8 +76,8 @@ class ReindexRequest(BaseModel):
 
 def save_repo_configs():
     try:
-        with open(REPO_CONFIGS_FILE, "w") as f:
-            json.dump(REPO_CONFIGS, f)
+        with open(REPO_CONFIGS_FILE, "w") as fobj:
+            json.dump(REPO_CONFIGS, fobj)  # type: ignore
     except TypeError as e:
         print(f"Error saving repo configs: {e}")
         # Optionally, you can log this error or handle it in a way that fits your application's needs
@@ -125,7 +125,8 @@ async def manage_repository(action: RepositoryAction):
         try:
             qclient.delete_collection(collection_name=action.repo_name)
         except Exception as e:
-            REPO_CONFIGS[action.repo_name] = action.repo_path  # Restore the config if deletion fails
+            # Restore the config if deletion fails
+            REPO_CONFIGS[action.repo_name] = action.repo_path  # type: ignore
             raise HTTPException(status_code=500, detail=f"Failed to delete collection: {str(e)}")
 
         save_repo_configs()
