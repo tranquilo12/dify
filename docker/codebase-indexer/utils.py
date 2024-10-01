@@ -264,12 +264,14 @@ def process_repository_ts(repo_path: Path, parser: Parser) -> List[CodeChunk]:
 
     for ext in react_file_extensions:
         for file_path in repo_path.rglob(f"*{ext}"):
-            if not is_ignored(file_path, repo_path, gitignore_spec):
-                try:
-                    chunks = chunk_code_file(str(file_path), parser)
-                    all_chunks.extend(chunks)
-                except Exception as e:
-                    print(f"Error processing {file_path}: {str(e)}")
+            filename = str(file_path).split("/")[-1]
+            if ("webpack" not in filename) and ("jest" not in filename):
+                if not is_ignored(file_path, repo_path, gitignore_spec):
+                    try:
+                        chunks = chunk_code_file(str(file_path), parser)
+                        all_chunks.extend(chunks)
+                    except Exception as e:
+                        print(f"Error processing {file_path}: {str(e)}")
 
     return all_chunks
 
