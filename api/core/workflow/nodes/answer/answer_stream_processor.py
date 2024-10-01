@@ -83,7 +83,7 @@ class AnswerStreamProcessor(StreamProcessor):
         :return:
         """
         for answer_node_id, position in self.route_position.items():
-            # all depends on answer node id not in rest node ids
+            # all depends on answer node id not in qrest node ids
             if event.route_node_state.node_id != answer_node_id and (
                 answer_node_id not in self.rest_node_ids
                 or not all(
@@ -156,7 +156,7 @@ class AnswerStreamProcessor(StreamProcessor):
             if answer_node_id not in self.rest_node_ids:
                 continue
 
-            # all depends on answer node id not in rest node ids
+            # all depends on answer node id not in qrest node ids
             if all(
                 dep_id not in self.rest_node_ids for dep_id in self.generate_routes.answer_dependencies[answer_node_id]
             ):

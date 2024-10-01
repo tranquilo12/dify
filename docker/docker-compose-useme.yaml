@@ -70,6 +70,7 @@ services:
     environment:
       <<: *shared-api-worker-env
       MODE: api
+      QDRANT_URL: http://qdrant:6333
     depends_on:
       - db
       - redis
@@ -78,7 +79,8 @@ services:
     volumes:
       - ./volumes/app/storage:/app/api/storage
     networks:
-      - ssrf_proxy_network
+      - dify_network
+#      - ssrf_proxy_network
       - default
 
   worker:
@@ -87,6 +89,7 @@ services:
     environment:
       <<: *shared-api-worker-env
       MODE: worker
+      QDRANT_URL: http://qdrant:6333
     depends_on:
       - db
       - redis
@@ -95,8 +98,9 @@ services:
     volumes:
       - ./volumes/app/storage:/app/api/storage
     networks:
-      - ssrf_proxy_network
+#      - ssrf_proxy_network
       - default
+      - dify_network
 
   web:
     image: langgenius/dify-web:0.8.2
@@ -106,8 +110,36 @@ services:
       APP_API_URL: ${APP_API_URL:-}
       SENTRY_DSN: ${WEB_SENTRY_DSN:-}
       NEXT_TELEMETRY_DISABLED: ${NEXT_TELEMETRY_DISABLED:-0}
+    networks:
+#      - ssrf_proxy_network
+      - default
+      - dify_network
 
   ###### Other stuff ######
+  interpreter-py:
+    build:
+      context: .
+      dockerfile: interpreter-py/Dockerfile.fastapi
+    ports:
+      - "8000:8000"
+
+  litellm-proxy:
+    build:
+      context: .
+      dockerfile: litellm-proxy/Dockerfile.lite
+      args:
+        target: runtime
+    volumes:
+      - /Users/shriramsunder/Projects/dify/docker/litellm-proxy/config.yaml:/app/config.yaml
+    ports:
+      - "4000:4000" # Map the container port to the host, change the host port if necessary
+      - "1234:1234" # Expose for access to LM Studio (local LLM Proxy)
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      VOYAGE_API_KEY: ${VOYAGE_API_KEY}
+    env_file:
+      - litellm-proxy/.env # Load local .env file
+
   qdrant:
     image: langgenius/qdrant:v1.7.3
     restart: always
@@ -117,24 +149,31 @@ services:
       - qdrant_storage:/qdrant/storage
     environment:
       QDRANT_API_KEY: ${QDRANT_API_KEY:-difyai123456}
+    networks:
+      - dify_network
+      - default
 
   codebase-indexer:
     build:
       context: .
       dockerfile: codebase-indexer/Dockerfile.fastapi
     volumes:
-      - /Users/shriramsunder/Projects/IntoTheDeep:/app/codebase/IntoTheDeep
-      - /Users/shriramsunder/Projects/ParationalServices/ParationalAddOn/officeAddOn:/app/codebase/officeAddOn
-      - /Users/shriramsunder/Projects/LLMStuff/:/app/codebase/LLMStuff
-      - /Users/shriramsunder/Projects/dify/docker/codebase-indexer:/app/codebase/codebase-indexer
+      - /Users/shriramsunder/Projects/IntoTheDeep:/volumes/IntoTheDeep
+      - /Users/shriramsunder/Projects/ParationalServices/ParationalAddOn/officeAddOn:/volumes/officeAddOn
+      - /Users/shriramsunder/Projects/LLMStuff/:/volumes/LLMStuff
+      - /Users/shriramsunder/Projects/dify:/volumes/dify
     environment:
       - QDRANT_URL=http://qdrant:6333
       - QDRANT_API_KEY=${QDRANT_API_KEY:-difyai123456}
+      - VOYAGE_URL=http://litellm-proxy:4000
       - VOYAGE_API_KEY=${VOYAGE_API_KEY}
     depends_on:
       - qdrant
     ports:
       - "7779:7779"
+    networks:
+      - dify_network
+      - default
 
   cli:
     build:
@@ -198,6 +237,8 @@ services:
       - ./volumes/sandbox/dependencies:/dependencies
     networks:
       - ssrf_proxy_network
+      - dify_network
+      - default
 
   ssrf_proxy:
     image: ubuntu/squid:latest
@@ -286,5 +327,7 @@ volumes:
 networks:
   ssrf_proxy_network:
     internal: true
+  dify_network:
+    driver: bridge
   default:
     driver: bridge

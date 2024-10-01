@@ -163,7 +163,7 @@ export function registerLexicalTextEntity<T extends TextNode>(
     }
 
     if (text.length > match.end) {
-      // This will split out the rest of the text as simple text
+      // This will split out the qrest of the text as simple text
       node.splitText(match.end)
       return
     }

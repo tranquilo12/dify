@@ -92,7 +92,7 @@ class EndStreamProcessor(StreamProcessor):
         :return:
         """
         for end_node_id, position in self.route_position.items():
-            # all depends on end node id not in rest node ids
+            # all depends on end node id not in qrest node ids
             if event.route_node_state.node_id != end_node_id and (
                 end_node_id not in self.rest_node_ids
                 or not all(
@@ -161,7 +161,7 @@ class EndStreamProcessor(StreamProcessor):
             if end_node_id not in self.rest_node_ids:
                 continue
 
-            # all depends on end node id not in rest node ids
+            # all depends on end node id not in qrest node ids
             if all(dep_id not in self.rest_node_ids for dep_id in self.end_stream_param.end_dependencies[end_node_id]):
                 if route_position >= len(self.end_stream_param.end_stream_variable_selector_mapping[end_node_id]):
                     continue

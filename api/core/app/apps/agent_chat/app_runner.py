@@ -56,8 +56,8 @@ class AgentChatAppRunner(AppRunner):
         files = application_generate_entity.files
 
         # Pre-calculate the number of tokens of the prompt messages,
-        # and return the rest number of tokens by model context token size limit and max token size limit.
-        # If the rest number of tokens is not enough, raise exception.
+        # and return the qrest number of tokens by model context token size limit and max token size limit.
+        # If the qrest number of tokens is not enough, raise exception.
         # Include: prompt template, inputs, query(optional), files(optional)
         # Not Include: memory, external data, dataset context
         self.get_pre_calculate_rest_tokens(

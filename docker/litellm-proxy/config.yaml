@@ -1,0 +1,41 @@
+model_list:
+#  - model_name: claude-3.5-sonnet
+#    litellm_params:
+#      model: anthropic/claude-3-5-sonnet-20240620
+#      api_key: "os.environ/ANTHROPIC_API_KEY" # does os.getenv("AZURE_API_KEY_EU")
+#
+#  - model_name: claude-3-opus
+#    litellm_params:
+#      model: anthropic/claude-3-opus-20240620
+#      api_key: "os.environ/ANTHROPIC_API_KEY" # does os.getenv("AZURE_API_KEY_EU")
+
+  # These two models are local, and need to be served from LiteLLM to ensure OpenAI compatibility
+  - model_name: deepseek-coder-v2
+    litellm_params:
+      model: openai/DeepSeek-Coder-V2-Lite-Instruct-GGUF
+      api_key: "os.environ/ANTHROPIC_API_KEY" # does os.getenv("AZURE_API_KEY_EU")
+      api_base: http://host.docker.internal:1234/v1
+
+  - model_name: llama-3.1-8B
+    litellm_params:
+      model: openai/Meta-Llama-3.1-8B-Instruct-GGUF
+      api_key: "os.environ/ANTHROPIC_API_KEY" # does os.getenv("AZURE_API_KEY_EU")
+      api_base: http://host.docker.internal:1234/v1
+
+  # These two models are remote, and need to be served from LiteLLM too, to ensure OpenAI compatibility
+  # mainly because it looks like
+  - model_name: voyage-3
+    litellm_params:
+      model: voyage/voyage-3
+      api_key: "os.environ/VOYAGE_API_KEY" # does os.getenv("VOYAGE_API_KEY")
+      api_base: https://api.voyageai.com/v1
+
+#  - model_name: rerank-2
+#    litellm_params:
+#      model: voyage/rerank-2
+#      api_key: "os.environ/VOYAGE_API_KEY" # does os.getenv("VOYAGE_API_KEY")
+#      api_base: https://api.voyageai.com/v1/rerank
+
+litellm_settings:
+  set_verbose: true
+  drop_params: true # This is just true cause anthropic's function definition is not incorporated into our frontend yet.

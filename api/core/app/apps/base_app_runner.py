@@ -41,7 +41,7 @@ class AppRunner:
         query: Optional[str] = None,
     ) -> int:
         """
-        Get pre calculate rest tokens
+        Get pre calculate qrest tokens
         :param app_record: app record
         :param model_config: model config entity
         :param prompt_template_entity: prompt template entity

@@ -13,9 +13,5 @@ rich
 tqdm
 numpy
 pandas
-torch
-transformers
-sentence-transformers
-watchdog
-click
-pytest
+tenacity
+tiktoken

@@ -1,0 +1,10 @@
+boto3
+GitPython
+openai
+pydantic
+python-dotenv
+fastapi
+uvicorn
+qdrant-client
+pytest
+httpx

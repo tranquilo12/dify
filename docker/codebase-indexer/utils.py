@@ -1,18 +1,23 @@
 import json
 import os
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Union
+from pathlib import Path, WindowsPath
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pathspec
 import requests
+import tiktoken
 import tree_sitter_python as tspython
 import tree_sitter_typescript as xtypescript
 from dotenv import load_dotenv
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_fixed
+from tqdm import trange
 from tree_sitter import Language, Parser, Point
 
+TIK_ENCODER = tiktoken.get_encoding('cl100k_base')
 load_dotenv()
 
 
@@ -47,6 +52,48 @@ class CodeChunk:
     file_path: str
 
 
+# TODO: Need to change the tokenizer to use the voyage tokenizer for embeddings
+def split_code_chunk(chunk: CodeChunk, max_tokens: int = 8192) -> List[CodeChunk]:
+    content = chunk.content
+    tokens = TIK_ENCODER.encode(
+        content, disallowed_special=(
+                TIK_ENCODER.special_tokens_set - {'<|endoftext|>', '<|fim_prefix|>', '<|fim_middle|>', '<|fim_suffix|>',
+                                                  '<|endofprompt|>'})
+    )
+
+    if len(tokens) <= max_tokens:
+        return [chunk]
+
+    splits = []
+    start = 0
+    while start < len(tokens):
+        end = start + max_tokens
+        if end >= len(tokens):
+            end = len(tokens)
+        else:
+            # Find the last newline within the token limit
+            while end > start and tokens[end] != 10:  # 10 is the token for newline
+                end -= 1
+            if end == start:
+                end = start + max_tokens  # If no newline found, just cut at max_tokens
+
+        split_content = TIK_ENCODER.decode(tokens[start:end])
+        splits.append(
+            CodeChunk(
+                content=split_content,
+                chunk_type=f"{chunk.chunk_type}_split",
+                start_byte=chunk.start_byte + start,
+                end_byte=chunk.start_byte + end,
+                start_point=chunk.start_point,
+                end_point=chunk.end_point,
+                file_path=chunk.file_path
+            )
+        )
+        start = end
+
+    return splits
+
+
 def setup_tree_sitter_py() -> Parser:
     """
     Set up the tree-sitter parser for Python.
@@ -75,7 +122,7 @@ def setup_tree_sitter_ts() -> Parser:
     return parser
 
 
-def initialize_qdrant(collection_names: List[str]) -> QdrantClient:
+def initialize_qdrant() -> QdrantClient:
     """
     Initialize an in-memory Qdrant client and create a collection.
 
@@ -84,30 +131,52 @@ def initialize_qdrant(collection_names: List[str]) -> QdrantClient:
     QdrantClient
         Configured Qdrant client with an 'IntoTheDeep' collection.
     """
-    qdrant_url = os.environ.get('QDRANT_URL', 'http://localhost:6333')
-    client = QdrantClient(url=qdrant_url)
-
-    for collection_name in collection_names:
-        client.create_collection(
-            collection_name=collection_name,
-            vectors_config=models.VectorParams(size=1536, distance=models.Distance.COSINE),
-        )
+    qdrant_api_key = os.environ.get("QDRANT_API_KEY")
+    qdrant_url = os.environ.get("QDRANT_URL")
+    client = QdrantClient(qdrant_url, api_key=qdrant_api_key)
     return client
 
 
-def load_gitignore(repo_path: str) -> Optional[pathspec.PathSpec]:
-    gitignore_path = os.path.join(repo_path, ".gitignore")
-    if os.path.exists(gitignore_path):
-        with open(gitignore_path, "r") as gitignore_file:
-            return pathspec.PathSpec.from_lines("gitwildmatch", gitignore_file)
+def get_normalized_path(path: Union[str, Path]) -> Path:
+    if isinstance(path, str):
+        path = Path(path)
+    if os.name == 'nt':
+        return WindowsPath(path).resolve()
+    else:
+        return Path(path).resolve()
+
+
+def load_gitignore(repo_path: Path) -> Optional[pathspec.PathSpec]:
+    for directory in [repo_path, repo_path.parent, repo_path.parent.parent]:
+        gitignore_path = directory / ".gitignore"
+        if gitignore_path.exists():
+            with gitignore_path.open("r") as gitignore_file:
+                return pathspec.PathSpec.from_lines("gitwildmatch", gitignore_file)
     return None
 
 
-def is_ignored(path: str, gitignore_spec: Optional[pathspec.PathSpec]) -> bool:
-    if gitignore_spec and gitignore_spec.match_file(path):
+def is_ignored(path: Path, repo_root: Path, gitignore_spec: Optional[pathspec.PathSpec]) -> bool:
+    # Normalize paths
+    path = get_normalized_path(path)
+    repo_root = get_normalized_path(repo_root)
+
+    # Make path relative to repo root
+    try:
+        relative_path = path.relative_to(repo_root).as_posix()
+    except ValueError:
+        # If path is not relative to repo_root, consider it as not ignored
+        return False
+
+    if gitignore_spec:
+        # Use case-insensitive matching on Windows
+        match_func = gitignore_spec.match_file if os.name != 'nt' else lambda p: gitignore_spec.match_file(p.lower())
+        if match_func(relative_path):
+            return True
+
+    # Additional check for node_modules
+    if "node_modules" in relative_path.split('/'):
         return True
-    if "node_modules" in path.split(os.path.sep):
-        return True
+
     return False
 
 
@@ -170,77 +239,45 @@ def chunk_code_file(file_path: str, parser: Parser) -> List[CodeChunk]:
     return chunks
 
 
-def process_repository_py(
-    repo_path: str, parser: Parser
-) -> List[CodeChunk]:
+def process_repository_py(repo_path: Path, parser: Parser) -> List[CodeChunk]:
+    repo_path = get_normalized_path(repo_path)
     gitignore_spec = load_gitignore(repo_path)
     all_chunks = []
 
-    # Prepare the file list
-    files = [
-        (root, file)
-        for root, _, files in os.walk(repo_path)
-        for file in files
-        if file.endswith(".py")
-    ]
-
-    for root, file in files:
-        file_path = os.path.join(root, file)
-        if not is_ignored(file_path, gitignore_spec):
+    for file_path in repo_path.rglob("*.py"):
+        if not is_ignored(file_path, repo_path, gitignore_spec):
             try:
-                chunks = chunk_code_file(file_path, parser)
+                chunks = chunk_code_file(str(file_path), parser)
                 all_chunks.extend(chunks)
             except Exception as e:
                 print(f"Error processing {file_path}: {str(e)}")
-                print(f"Error details: {type(e).__name__}")
 
     return all_chunks
 
 
-def process_repository_ts(
-    repo_path: str, parser: Parser
-):
+def process_repository_ts(repo_path: Path, parser: Parser) -> List[CodeChunk]:
+    repo_path = get_normalized_path(repo_path)
     gitignore_spec = load_gitignore(repo_path)
     all_chunks = []
 
     react_file_extensions = ('.js', '.jsx', '.ts', '.tsx')
 
-    for root, _, files in os.walk(repo_path):
-        for file in files:
-            if file.endswith(react_file_extensions):
-                file_path = os.path.join(root, file)
-                if not is_ignored(file_path, gitignore_spec):
-                    try:
-                        chunks = chunk_code_file(file_path, parser)
-                        all_chunks.extend(chunks)
-                    except Exception as e:
-                        print(f"Error processing {file_path}: {str(e)}")
-                        print(f"Error details: {type(e).__name__}")
+    for ext in react_file_extensions:
+        for file_path in repo_path.rglob(f"*{ext}"):
+            if not is_ignored(file_path, repo_path, gitignore_spec):
+                try:
+                    chunks = chunk_code_file(str(file_path), parser)
+                    all_chunks.extend(chunks)
+                except Exception as e:
+                    print(f"Error processing {file_path}: {str(e)}")
 
     return all_chunks
 
 
-# Update the process_repositories function
-def process_repositories(
-    repo_configs: Dict[str, Dict[str, Union[str, Parser]]]
-) -> Dict[str, List[CodeChunk]]:
-    """
-    Process multiple repositories and return chunks for each.
-
-    Parameters
-    ----------
-    repo_configs : Dict[str, Dict[str, Union[str, Parser]]]
-        Dictionary mapping collection names to repository configurations.
-        Each configuration should have 'path', 'language', and 'parser' keys.
-
-    Returns
-    -------
-    Dict[str, List[CodeChunk]]
-        Dictionary mapping collection names to lists of CodeChunks.
-    """
+def process_repositories(repo_configs: Dict[str, Dict[str, Union[str, Parser]]]) -> Dict[str, List[CodeChunk]]:
     all_chunks = {}
     for collection_name, config in repo_configs.items():
-        repo_path = config['path']
+        repo_path = get_normalized_path(config['path'])
         language = config['language']
         parser = config['parser']
 
@@ -255,52 +292,61 @@ def process_repositories(
     return all_chunks
 
 
+@retry(
+    wait=wait_fixed(40),  # Wait 40s second between retries
+    stop=stop_after_attempt(5),  # Stop after 5 attempts
+    retry=retry_if_exception_type((requests.RequestException, Exception)),
+    reraise=True
+)
+def make_embedding_request(payload: str) -> List[np.ndarray]:
+    host = os.environ.get("VOYAGE_URL")
+    response = requests.post(
+        url=f"{host}/embeddings",
+        headers={
+            "Content-Type" : "application/json",
+            "Authorization": f"Bearer {os.getenv('VOYAGE_API_KEY')}"
+        },
+        data=payload
+    )
+    response.raise_for_status()
+    batch_embeddings = response.json()["data"]
+    return [np.array(emb["embedding"]) for emb in batch_embeddings]
+
+
 def get_embeddings(
     texts: Union[str, List[str]],
     batch_size: int = 32,
-) -> Union[np.ndarray, List[np.ndarray]]:
+) -> Tuple[List[np.ndarray], List[List[str]]]:
     if isinstance(texts, str):
         texts = [texts]
 
     texts = [text for text in texts if text.strip()]
     if not texts:
         print("Warning: No non-empty texts to embed")
-        return []
+        return [], []
 
     embeddings = []
-    for i in range(0, len(texts), batch_size):
+    unprocessed_batches = []
+    for i in trange(0, len(texts), batch_size, desc="Batches..."):
         batch = texts[i: i + batch_size]
         if isinstance(batch, str):
             batch = [batch]
 
-        # Ensure proper JSON encoding of the input
         payload = json.dumps(
             {
-                "model": "voyage-code-2",
-                "input": batch
+                "model": "voyage-3",  # TODO: Parameterize this
+                "input": batch,
             }
         )
+
         try:
-            response = requests.post(
-                url="https://api.voyageai.com/v1/embeddings",
-                headers={
-                    "Content-Type" : "application/json",
-                    "Authorization": f"Bearer {os.environ.get('VOYAGE_API_KEY')}"
-                },
-                data=payload
-            )
-            response.raise_for_status()
-        except requests.RequestException as e:
-            print(f"Error connecting to embedding service: {e}")
-            raise
+            batch_embeddings = make_embedding_request(payload)
+            embeddings.extend(batch_embeddings)
+        except Exception as e:
+            print(f"Failed to get embeddings for batch starting at index {i}: {str(e)}")
+            unprocessed_batches.append(batch)
 
-        if response.status_code == 200:
-            batch_embeddings = response.json()["data"]
-            embeddings.extend([np.array(emb["embedding"]) for emb in batch_embeddings])
-        else:
-            raise Exception(f"Error in getting embeddings: {response.text}")
-
-    return embeddings
+    return embeddings, unprocessed_batches
 
 
 def store_chunks_multi(
@@ -322,15 +368,13 @@ def store_chunks_multi(
         List of CodeChunk objects to store.
     embeddings : List[np.ndarray]
         List of embedding vectors corresponding to the chunks.
-    progress : Optional[Progress]
-        Rich Progress instance for tracking progress.
     """
 
     # Prepare points for batch insertion
     points = [
         models.PointStruct(
             id=i,
-            vector=embedding.tolist(),
+            vector={'custom_vector': embedding.tolist()},
             payload={
                 "content"    : chunk.content,
                 "chunk_type" : chunk.chunk_type,
@@ -346,6 +390,6 @@ def store_chunks_multi(
 
     # Batch insert points
     batch_size = 100  # Adjust based on your needs and Qdrants capabilities
-    for i in range(0, len(points), batch_size):
+    for i in trange(0, len(points), batch_size, desc="To qdrant..."):
         batch = points[i: i + batch_size]
         client.upsert(collection_name=collection_name, points=batch)

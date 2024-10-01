@@ -1,41 +1,59 @@
-import json
 import os
-from typing import Any, Dict, List
+import subprocess
+from typing import List
 
+import uvicorn
 from fastapi import FastAPI, HTTPException
-from fastapi.concurrency import run_in_threadpool
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel
 from qdrant_client import QdrantClient
-from qdrant_client.http import models
+from qdrant_client.http import models as qrest
+from qdrant_client.http.exceptions import UnexpectedResponse
+from tqdm.auto import tqdm
 
 from utils import (
-    get_embeddings, initialize_qdrant, process_repositories, setup_tree_sitter_py, setup_tree_sitter_ts,
+    get_embeddings,
+    initialize_qdrant,
+    process_repositories,
+    setup_tree_sitter_py,
+    setup_tree_sitter_ts,
+    split_code_chunk,
     store_chunks_multi,
 )
 
+VECTOR_SIZE = 1024
 app = FastAPI()
 
-# Load REPO_CONFIGS from file if it exists, otherwise initialize as empty dict
-REPO_CONFIGS_FILE = "repo_configs.json"
-if os.path.exists(REPO_CONFIGS_FILE):
-    with open(REPO_CONFIGS_FILE, "r") as f:
-        REPO_CONFIGS: Dict[str, Dict[str, Any]] = json.load(f)
-else:
-    REPO_CONFIGS: Dict[str, Dict[str, Any]] = {}
+REPO_CONFIGS = {
+    "IntoTheDeep"     : {
+        "path"    : "/volumes/IntoTheDeep",
+        "language": "python",
+        "parser"  : setup_tree_sitter_py()
+    },
+    "officeAddOn"     : {
+        "path"    : "/volumes/officeAddOn",
+        "language": "typescript",
+        "parser"  : setup_tree_sitter_ts()
+    },
+    "LLMStuff"        : {
+        "path"    : "/volumes/LLMStuff",
+        "language": "python",
+        "parser"  : setup_tree_sitter_py()
+    },
+    "dify": {
+        "path"    : "/volumes/dify",
+        "language": "python",
+        "parser"  : setup_tree_sitter_py()
+    },
+    # Add more repositories as needed
+}
 
 # Initialize components
-qclient: QdrantClient = initialize_qdrant(collection_names=list(REPO_CONFIGS.keys()))
+qclient: QdrantClient = initialize_qdrant()
 
 
 class Query(BaseModel):
     text: str
-    collection_name: str
-
-    @field_validator('text')
-    def text_must_not_be_empty(cls, v):
-        if not v.strip():
-            raise ValueError('Query text must not be empty')
-        return v
+    collection_name: str  # The project name
 
 
 class SearchResult(BaseModel):
@@ -45,133 +63,145 @@ class SearchResult(BaseModel):
     similarity: float
 
 
-class RepositoryAction(BaseModel):
-    action: str
-    repo_name: str
-    repo_path: str = ""
-    language: str = ""
-
-    @field_validator('action')
-    def action_must_be_valid(cls, v: str) -> str:
-        if v not in ["add", "remove"]:
-            raise ValueError('Action must be either "add" or "remove"')
-        return v
-
-    @field_validator('repo_name')
-    def repo_name_must_not_be_empty(cls, v: str) -> str:
-        if not v.strip():
-            raise ValueError('Repository name must not be empty')
-        return v
-
-
-class ReindexRequest(BaseModel):
+class CommitMsgRequest(BaseModel):
     repo_name: str
 
-    @field_validator('repo_name')
-    def repo_name_must_not_be_empty(cls, v):
-        if not v.strip():
-            raise ValueError('Repository name must not be empty')
-        return v
 
-
-def save_repo_configs():
+def get_git_diff(repo_path: str) -> str:
     try:
-        with open(REPO_CONFIGS_FILE, "w") as fobj:
-            json.dump(REPO_CONFIGS, fobj)  # type: ignore
-    except TypeError as e:
-        print(f"Error saving repo configs: {e}")
-        # Optionally, you can log this error or handle it in a way that fits your application's needs
+        # Change to the repository directory
+        os.chdir(repo_path)
+
+        # Run 'git diff' command
+        result = subprocess.run(['git', 'diff'], capture_output=True, text=True, check=True)
+
+        # Return the output
+        return result.stdout
+    except subprocess.CalledProcessError as e:
+        # If the command fails, return the error message
+        return f"Error: {e.stderr}"
+    except Exception as e:
+        # For any other exception, return a generic error message
+        return f"An error occurred: {str(e)}"
 
 
-@app.post("/repositories")
-async def manage_repository(action: RepositoryAction):
-    if action.action == "add":
-        if action.repo_name in REPO_CONFIGS:
-            raise HTTPException(status_code=400, detail="Repository already exists")
+@app.post("/git-diff")
+async def generate_commit_msg(request: CommitMsgRequest):
+    if request.repo_name not in REPO_CONFIGS:
+        raise HTTPException(status_code=400, detail="Invalid repository name")
 
-        if not os.path.exists(action.repo_path):
-            raise HTTPException(status_code=400, detail="Repository path does not exist")
+    repo_path = REPO_CONFIGS[request.repo_name]["path"]
+    git_diff = get_git_diff(repo_path)
 
-        REPO_CONFIGS[action.repo_name] = {
-            "path"    : action.repo_path,
-            "language": action.language,
-        }
+    if git_diff.startswith("Error:") or git_diff.startswith("An error occurred:"):
+        raise HTTPException(status_code=500, detail=git_diff)
 
+    # For now, we'll just return the diff
+    return {"diff": git_diff}
+
+
+@app.post("/index")
+async def index_codebases():
+    messages = []
+    all_chunks = process_repositories(REPO_CONFIGS)
+    collection_names = list(all_chunks.keys())
+
+    # Create collection with vector configuration
+    for col in collection_names:
         try:
             qclient.create_collection(
-                collection_name=action.repo_name,
-                vectors_config=models.VectorParams(size=1536, distance=models.Distance.COSINE),
+                collection_name=col,
+                vectors_config={
+                    'custom_vector': qrest.VectorParams(
+                        distance=qrest.Distance.COSINE,
+                        size=VECTOR_SIZE,
+                    ),
+                }
             )
-        except Exception as e:
-            del REPO_CONFIGS[action.repo_name]
-            raise HTTPException(status_code=500, detail=f"Failed to create collection: {str(e)}")
+        except UnexpectedResponse:
+            # Collection already exists, continue
+            pass
 
-        try:
-            # Run the indexing process in a separate thread
-            await run_in_threadpool(index_repository, action.repo_name)
-        except Exception as e:
-            del REPO_CONFIGS[action.repo_name]
-            qclient.delete_collection(collection_name=action.repo_name)
-            raise HTTPException(status_code=500, detail=f"Failed to index repository: {str(e)}")
+    for collection_name, chunks in tqdm(all_chunks.items(), total=len(all_chunks), desc="Collections..."):
+        processed_chunks = []
+        for chunk in tqdm(chunks, desc="Chunks..."):
+            if len(str(chunk.content)) > 0:
+                split_chunks = split_code_chunk(chunk)
+                processed_chunks.extend(split_chunks)
 
-        save_repo_configs()
-        return {"message": f"Repository '{action.repo_name}' added and indexed successfully"}
+        if not processed_chunks:
+            messages.append(f"No valid chunks found for collection {collection_name}")
+            continue
 
-    elif action.action == "remove":
-        if action.repo_name not in REPO_CONFIGS:
-            raise HTTPException(status_code=404, detail="Repository not found")
+        chunk_contents = [chunk.content for chunk in processed_chunks]
 
-        del REPO_CONFIGS[action.repo_name]
-        try:
-            qclient.delete_collection(collection_name=action.repo_name)
-        except Exception as e:
-            # Restore the config if deletion fails
-            REPO_CONFIGS[action.repo_name] = action.repo_path  # type: ignore
-            raise HTTPException(status_code=500, detail=f"Failed to delete collection: {str(e)}")
+        max_retries = 3
+        retry_count = 0
+        unprocessed_batches = None
+        while retry_count < max_retries:
+            embeddings, unprocessed_batches = get_embeddings(texts=chunk_contents, batch_size=5)
 
-        save_repo_configs()
-        return {"message": f"Repository '{action.repo_name}' removed successfully"}
+            if embeddings:
+                try:
+                    store_chunks_multi(
+                        qclient,
+                        collection_name,
+                        processed_chunks[:len(embeddings)],
+                        embeddings
+                    )
+                except Exception as e:
+                    messages.append(f"Error storing embeddings for collection `{collection_name}`: {str(e)}")
+                    break  # Exit the retry loop if storing fails
 
+            if not unprocessed_batches:
+                messages.append(f"Collection `{collection_name}` indexed successfully")
+                break  # Exit the retry loop if all batches are processed
 
-@app.post("/reindex")
-async def reindex_repository(request: ReindexRequest):
-    if request.repo_name not in REPO_CONFIGS:
-        raise HTTPException(status_code=404, detail="Repository not found")
+            # Prepare for next retry
+            chunk_contents = [item for batch in unprocessed_batches for item in batch]
+            processed_chunks = [chunk for chunk in processed_chunks if chunk.content in chunk_contents]
+            retry_count += 1
 
-    try:
-        # Run the indexing process in a separate thread
-        await run_in_threadpool(index_repository, request.repo_name)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to reindex repository: {str(e)}")
+        if retry_count == max_retries and unprocessed_batches:
+            messages.append(
+                f"Failed to process all batches for collection `{collection_name}` after {max_retries} retries"
+            )
 
-    return {"message": f"Repository '{request.repo_name}' reindexed successfully"}
+    return {"message": messages}
 
 
 @app.post("/search", response_model=List[SearchResult])
 async def search(query: Query):
+    results = []
     if query.collection_name not in REPO_CONFIGS:
         raise HTTPException(status_code=400, detail="Invalid collection name")
 
-    try:
-        query_embedding = get_embeddings(query.text)
-        search_results = qclient.search(
-            collection_name=query.collection_name,
-            query_vector=query_embedding[0],
-            limit=5
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
+    query_embedding, unprocessed_batches = get_embeddings(query.text)
+    query_vector = qrest.NamedVector(name='custom_vector', vector=query_embedding[0].tolist())
 
-    results = []
+    print(f"{query.collection_name=}")
+
+    search_results = qclient.search(
+        collection_name=query.collection_name,
+        # query_vector=('custom_vector', query_embedding[0].tolist()),  # type: ignore
+        query_vector=query_vector,
+        limit=5,
+        with_payload=True,
+    )
+
     for hit in search_results:
-        results.append(
-            SearchResult(
-                file_path=hit.payload["file_path"],
-                code=hit.payload["content"],
-                chunk_type=hit.payload["chunk_type"],
-                similarity=hit.score,
+        # Add an extra check to ensure the result is from the correct repository
+        if hit.payload["file_path"].startswith(REPO_CONFIGS[query.collection_name]["path"]):
+            results.append(
+                SearchResult(
+                    file_path=hit.payload["file_path"],
+                    code=hit.payload["content"],
+                    chunk_type=hit.payload["chunk_type"],
+                    similarity=hit.score,
+                )
             )
-        )
+        else:
+            print(f"Warning: Filtered out result from unexpected path: {hit.payload['file_path']}")
 
     return results
 
@@ -181,22 +211,5 @@ async def list_collections():
     return {"collections": list(REPO_CONFIGS.keys())}
 
 
-def index_repository(repo_name: str):
-    repo_config = REPO_CONFIGS[repo_name]
-    language = repo_config["language"]
-    parser = setup_tree_sitter_py() if language == "python" else setup_tree_sitter_ts()
-
-    chunks = process_repositories({repo_name: {**repo_config, "parser": parser}})
-    chunk_contents = [chunk.content for chunk in chunks[repo_name]]
-    embs = get_embeddings(texts=chunk_contents, batch_size=32)
-
-    # Clear existing data for the repository
-    qclient.delete(collection_name=repo_name, points_selector=models.FilterSelector(filter=models.Filter()))
-
-    # Store new chunks
-    store_chunks_multi(
-        client=qclient,
-        collection_name=repo_name,
-        chunks=chunks[repo_name],
-        embeddings=embs
-    )
+if __name__ == "__main__":
+    uvicorn.run("app:app", port=7779)
