@@ -17,6 +17,11 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_fi
 from tqdm import trange
 from tree_sitter import Language, Parser, Point
 
+from git_operations import (
+    GitRepo, detect_changes, get_files_to_index, load_last_indexed_commit, save_last_indexed_commit,
+)
+from logger import indexer_logger as logger
+
 TIK_ENCODER = tiktoken.get_encoding('cl100k_base')
 load_dotenv()
 
@@ -180,7 +185,7 @@ def is_ignored(path: Path, repo_root: Path, gitignore_spec: Optional[pathspec.Pa
     return False
 
 
-def chunk_code_file(file_path: str, parser: Parser) -> List[CodeChunk]:
+def chunk_code_file(file_path: Path, parser: Parser) -> List[CodeChunk]:
     """
     Chunk a Python file into CodeChunk objects.
 
@@ -196,8 +201,9 @@ def chunk_code_file(file_path: str, parser: Parser) -> List[CodeChunk]:
     List[CodeChunk]
         List of CodeChunk objects representing the file content.
     """
-    with open(file_path, "rb") as file:
-        content = file.read()
+    content = file_path.read_bytes()
+    # with open(file_path, "rb") as file:
+    #     content = file.read()
 
     try:
         decoded_content = content.decode("utf-8")
@@ -216,7 +222,7 @@ def chunk_code_file(file_path: str, parser: Parser) -> List[CodeChunk]:
         len(content),
         tree.root_node.start_point,
         tree.root_node.end_point,
-        file_path,
+        str(file_path),
     )]
 
     # File-level chunk
@@ -232,7 +238,7 @@ def chunk_code_file(file_path: str, parser: Parser) -> List[CodeChunk]:
                     node.end_byte,
                     node.start_point,
                     node.end_point,
-                    file_path,
+                    str(file_path),
                 )
             )
 
@@ -247,10 +253,10 @@ def process_repository_py(repo_path: Path, parser: Parser) -> List[CodeChunk]:
     for file_path in repo_path.rglob("*.py"):
         if not is_ignored(file_path, repo_path, gitignore_spec):
             try:
-                chunks = chunk_code_file(str(file_path), parser)
+                chunks = chunk_code_file(file_path, parser)
                 all_chunks.extend(chunks)
             except Exception as e:
-                print(f"Error processing {file_path}: {str(e)}")
+                print(f"Error processing {str(file_path)}: {str(e)}")
 
     return all_chunks
 
@@ -276,21 +282,42 @@ def process_repository_ts(repo_path: Path, parser: Parser) -> List[CodeChunk]:
     return all_chunks
 
 
-def process_repositories(repo_configs: Dict[str, Dict[str, Union[str, Parser]]]) -> Dict[str, List[CodeChunk]]:
+async def process_repositories(
+    repo_configs: Dict[str, Dict[str, Union[str, Parser]]],
+    force: bool = False
+) -> Dict[str, List[CodeChunk]]:
     all_chunks = {}
     for collection_name, config in repo_configs.items():
-        repo_path = get_normalized_path(config['path'])
-        language = config['language']
-        parser = config['parser']
+        try:
+            repo_path = config['path']
+            language = config['language']
+            parser = config['parser']
 
-        if language == 'python':
-            chunks = process_repository_py(repo_path, parser)
-        elif language == 'typescript':
-            chunks = process_repository_ts(repo_path, parser)
-        else:
-            raise ValueError(f"Unsupported language: {language}")
+            git_repo = GitRepo(repo_path)
+            last_indexed_commit = None if force else load_last_indexed_commit(repo_path)
 
-        all_chunks[collection_name] = chunks
+            if force or detect_changes(git_repo, last_indexed_commit):
+                logger.info(f"Processing repository: {collection_name}")
+                allowed_extensions = ['.py'] if language == 'python' else ['.js', '.jsx', '.ts', '.tsx']
+                files_to_index = get_files_to_index(git_repo, last_indexed_commit, allowed_extensions)
+
+                chunks = []
+                for file_path in files_to_index:
+                    try:
+                        file_chunks = chunk_code_file(file_path, parser)
+                        chunks.extend(file_chunks)
+                    except Exception as e:
+                        logger.error(f"Error processing {file_path}: {str(e)}")
+
+                all_chunks[collection_name] = chunks
+
+                save_last_indexed_commit(repo_path, git_repo.get_latest_commit())
+                logger.info(f"Finished processing repository: {collection_name}")
+            else:
+                logger.info(f"No changes detected for {collection_name}")
+        except Exception as e:
+            logger.error(f"Error processing repository {collection_name}: {str(e)}")
+
     return all_chunks
 
 

@@ -1,45 +1,64 @@
+import asyncio
 import os
 import subprocess
+from contextlib import asynccontextmanager
 from typing import List
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qrest
 from qdrant_client.http.exceptions import UnexpectedResponse
-from tqdm.auto import tqdm
 
+from git_operations import GitRepo, save_last_indexed_commit
 from utils import (
-    get_embeddings,
-    initialize_qdrant,
-    process_repositories,
-    setup_tree_sitter_py,
-    setup_tree_sitter_ts,
-    split_code_chunk,
-    store_chunks_multi,
+    get_embeddings, initialize_qdrant, logger, process_repositories, setup_tree_sitter_py, setup_tree_sitter_ts,
+    split_code_chunk, store_chunks_multi,
 )
 
 VECTOR_SIZE = 1024
-app = FastAPI()
+
+
+async def check_and_index_repositories():
+    while True:
+        try:
+            logger.info("Starting periodic indexing")
+            await run_in_threadpool(index_codebases)
+            logger.info("Finished periodic indexing")
+        except Exception as e:
+            logger.error(f"Error during periodic indexing: {str(e)}")
+        await asyncio.sleep(300)  # Check every 10 minutes
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    background_tasks = BackgroundTasks()
+    background_tasks.add_task(check_and_index_repositories)
+    logger.info("Started background indexing task")
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 REPO_CONFIGS = {
-    "IntoTheDeep"     : {
+    "IntoTheDeep": {
         "path"    : "/volumes/IntoTheDeep",
         "language": "python",
         "parser"  : setup_tree_sitter_py()
     },
-    "officeAddOn"     : {
+    "officeAddOn": {
         "path"    : "/volumes/officeAddOn",
         "language": "typescript",
         "parser"  : setup_tree_sitter_ts()
     },
-    "LLMStuff"        : {
+    "LLMStuff"   : {
         "path"    : "/volumes/LLMStuff",
         "language": "python",
         "parser"  : setup_tree_sitter_py()
     },
-    "dify": {
+    "dify"       : {
         "path"    : "/volumes/dify",
         "language": "python",
         "parser"  : setup_tree_sitter_py()
@@ -102,44 +121,42 @@ async def generate_commit_msg(request: CommitMsgRequest):
 
 @app.post("/index")
 async def index_codebases():
-    messages = []
-    all_chunks = process_repositories(REPO_CONFIGS)
-    collection_names = list(all_chunks.keys())
+    try:
+        logger.info("Manual indexing triggered")
+        messages = []
+        all_chunks = await process_repositories(REPO_CONFIGS)
+        collection_names = list(all_chunks.keys())
 
-    # Create collection with vector configuration
-    for col in collection_names:
-        try:
-            qclient.create_collection(
-                collection_name=col,
-                vectors_config={
-                    'custom_vector': qrest.VectorParams(
-                        distance=qrest.Distance.COSINE,
-                        size=VECTOR_SIZE,
-                    ),
-                }
-            )
-        except UnexpectedResponse:
-            # Collection already exists, continue
-            pass
+        # Create collection with vector configuration
+        for col in collection_names:
+            try:
+                qclient.create_collection(
+                    collection_name=col,
+                    vectors_config={
+                        'custom_vector': qrest.VectorParams(
+                            distance=qrest.Distance.COSINE,
+                            size=VECTOR_SIZE,
+                        ),
+                    }
+                )
+            except UnexpectedResponse:
+                # Collection already exists, continue
+                pass
 
-    for collection_name, chunks in tqdm(all_chunks.items(), total=len(all_chunks), desc="Collections..."):
-        processed_chunks = []
-        for chunk in tqdm(chunks, desc="Chunks..."):
-            if len(str(chunk.content)) > 0:
-                split_chunks = split_code_chunk(chunk)
-                processed_chunks.extend(split_chunks)
+        for collection_name, chunks in all_chunks.items():
+            if not chunks:
+                messages.append(f"No new changes to index for collection {collection_name}")
+                continue
 
-        if not processed_chunks:
-            messages.append(f"No valid chunks found for collection {collection_name}")
-            continue
+            processed_chunks = []
+            for chunk in chunks:
+                if len(str(chunk.content)) > 0:
+                    split_chunks = split_code_chunk(chunk)
+                    processed_chunks.extend(split_chunks)
 
-        chunk_contents = [chunk.content for chunk in processed_chunks]
+            chunk_contents = [chunk.content for chunk in processed_chunks]
 
-        max_retries = 3
-        retry_count = 0
-        unprocessed_batches = None
-        while retry_count < max_retries:
-            embeddings, unprocessed_batches = get_embeddings(texts=chunk_contents, batch_size=5)
+            embeddings, _ = get_embeddings(texts=chunk_contents, batch_size=5)
 
             if embeddings:
                 try:
@@ -149,25 +166,87 @@ async def index_codebases():
                         processed_chunks[:len(embeddings)],
                         embeddings
                     )
+                    messages.append(f"Collection `{collection_name}` indexed successfully")
                 except Exception as e:
                     messages.append(f"Error storing embeddings for collection `{collection_name}`: {str(e)}")
-                    break  # Exit the retry loop if storing fails
+            else:
+                messages.append(f"No embeddings generated for collection `{collection_name}`")
 
-            if not unprocessed_batches:
-                messages.append(f"Collection `{collection_name}` indexed successfully")
-                break  # Exit the retry loop if all batches are processed
+        logger.info("Manual indexing completed")
+        return {"message": messages}
+    except Exception as e:
+        logger.error(f"Error during manual indexing: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-            # Prepare for next retry
-            chunk_contents = [item for batch in unprocessed_batches for item in batch]
-            processed_chunks = [chunk for chunk in processed_chunks if chunk.content in chunk_contents]
-            retry_count += 1
 
-        if retry_count == max_retries and unprocessed_batches:
-            messages.append(
-                f"Failed to process all batches for collection `{collection_name}` after {max_retries} retries"
-            )
+@app.post("/force-index/{repo_name}")
+async def force_index(repo_name: str):
+    try:
+        if repo_name not in REPO_CONFIGS:
+            raise HTTPException(status_code=400, detail=f"Invalid repository name: {repo_name}")
 
-    return {"message": messages}
+        config = REPO_CONFIGS[repo_name]
+        repo_path = config['path']
+        language = config['language']
+        parser = config['parser']
+
+        git_repo = GitRepo(repo_path)
+
+        # Force re-indexing by setting last_indexed_commit to None
+        all_chunks = await process_repositories({repo_name: config}, force=True)
+
+        messages = []
+        if not all_chunks.get(repo_name):
+            messages.append(f"No chunks to index for repository {repo_name}")
+            return {"message": messages}
+
+        try:
+            # Ensure collection exists
+            try:
+                qclient.create_collection(
+                    collection_name=repo_name,
+                    vectors_config={
+                        'custom_vector': qrest.VectorParams(
+                            distance=qrest.Distance.COSINE,
+                            size=VECTOR_SIZE,
+                        ),
+                    }
+                )
+            except Exception:  # type: ignore
+                # Collection might already exist, continue
+                pass
+
+            processed_chunks = []
+            for chunk in all_chunks[repo_name]:
+                if len(str(chunk.content)) > 0:
+                    split_chunks = split_code_chunk(chunk)
+                    processed_chunks.extend(split_chunks)
+
+            chunk_contents = [chunk.content for chunk in processed_chunks]
+
+            embeddings, _ = get_embeddings(texts=chunk_contents, batch_size=5)
+
+            if embeddings:
+                await store_chunks_multi(
+                    qclient,
+                    repo_name,
+                    processed_chunks[:len(embeddings)],
+                    embeddings
+                )
+                messages.append(f"Repository `{repo_name}` indexed successfully")
+
+                # Save the new last indexed commit
+                save_last_indexed_commit(repo_path, git_repo.get_latest_commit())
+            else:
+                messages.append(f"No embeddings generated for repository `{repo_name}`")
+
+        except Exception as e:
+            messages.append(f"Error indexing repository `{repo_name}`: {str(e)}")
+
+        return {"message": messages}
+    except Exception as e:
+        logger.error(f"Error during force indexing of {repo_name}: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/search", response_model=List[SearchResult])

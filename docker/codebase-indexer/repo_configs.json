@@ -1,1 +1,10 @@
-{"officeAddOn": {"path": "/Users/shriramsunder/Projects/ParationalServices/ParationalAddOn/officeAddOn", "language": "typescript"}}
+{
+  "officeAddOn": {
+	"path": "/Users/shriramsunder/Projects/ParationalServices/ParationalAddOn/officeAddOn",
+	"language": "typescript"
+  },
+  "dify": {
+	"path": "/volumes/dify",
+	"language": "python"
+  }
+}

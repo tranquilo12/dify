@@ -134,8 +134,6 @@ services:
     environment:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
       VOYAGE_API_KEY: ${VOYAGE_API_KEY}
-#    env_file:
-#      - litellm-proxy/.env # Load local .env file
 
   qdrant:
     image: langgenius/qdrant:v1.7.3
@@ -159,11 +157,14 @@ services:
       - ${OFFICE_ADDON_PATH}:/volumes/officeAddOn
       - ${LLM_STUFF_PATH}:/volumes/LLMStuff
       - ${DIFY_PATH}:/volumes/dify
+      - ./codebase-indexer:/app
+      - indexer-data:/app/data
     environment:
       - QDRANT_URL=http://qdrant:6333
       - QDRANT_API_KEY=${QDRANT_API_KEY:-difyai123456}
       - VOYAGE_URL=http://litellm-proxy:4000
       - VOYAGE_API_KEY=${VOYAGE_API_KEY}
+#      - ANOTHER_VOYAGE_API_KEY=${}
     depends_on:
       - qdrant
     ports:
@@ -171,26 +172,6 @@ services:
     networks:
       - dify_network
       - default
-#    env_file:
-#      - codebase-indexer/.env # Load local .env file
-
-  cli:
-    build:
-      context: .
-      dockerfile: codebase-indexer/Dockerfile.cli
-    volumes:
-      - ${INTO_THE_DEEP_PATH}:/app/codebase/IntoTheDeep
-      - ${OFFICE_ADDON_PATH}:/app/codebase/officeAddOn
-      - ${LLM_STUFF_PATH}:/app/codebase/LLMStuff
-      - ${DIFY_PATH}:/app/codebase/codebase-indexer
-    environment:
-      - API_URL=http://codebase-indexer:7779
-    depends_on:
-      - codebase-indexer
-    networks:
-      - default
-#    env_file:
-#      - codebase-indexer/.env # Load local .env file
 
   db:
     image: postgres:15-alpine
@@ -324,6 +305,7 @@ services:
 
 volumes:
   qdrant_storage:
+  indexer-data:
 
 networks:
   ssrf_proxy_network:

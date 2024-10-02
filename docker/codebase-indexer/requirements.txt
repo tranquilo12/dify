@@ -15,3 +15,4 @@ numpy
 pandas
 tenacity
 tiktoken
+watchdog
