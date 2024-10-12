@@ -1,37 +1,109 @@
-# Please do not directly edit this file. Instead, modify the .env variables related to NGINX configuration.
-
 server {
     listen ${NGINX_PORT};
     server_name ${NGINX_SERVER_NAME};
 
-    location /console/api {
-      proxy_pass http://api:5001;
-      include proxy.conf;
+    # Add CORS headers for all responses
+    add_header 'Access-Control-Allow-Origin' '*' always;
+    add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS, DELETE, PUT' always;
+    add_header 'Access-Control-Allow-Headers' 'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,Authorization' always;
+    add_header 'Access-Control-Expose-Headers' 'Content-Length,Content-Range' always;
+
+    # WebSocket configuration
+    location /ws {
+        proxy_pass http://frontend-react-app:9998;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_cache_bypass $http_upgrade;
     }
 
-    location /api {
-      proxy_pass http://api:5001;
-      include proxy.conf;
-    }
-
-    location /v1 {
-      proxy_pass http://api:5001;
-      include proxy.conf;
-    }
-
-    location /files {
-      proxy_pass http://api:5001;
-      include proxy.conf;
-    }
 
     location / {
-      proxy_pass http://web:3000;
-      include proxy.conf;
+        proxy_pass http://frontend-react-app:9998;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host $host;
+        proxy_cache_bypass $http_upgrade;
     }
 
-    # placeholder for acme challenge location
+    location /proxy-chat-messages {
+        proxy_pass http://frontend-react-app:3001;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host $host;
+        proxy_cache_bypass $http_upgrade;
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+    }
+
+    location /v1/chat-messages {
+        proxy_pass http://api:5001;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header X-Accel-Buffering no;
+        proxy_set_header Cache-Control no-cache;
+        proxy_cache off;
+        proxy_buffering off;
+        proxy_read_timeout 86400s;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+
+
+    # Proxy paths starting with /console/api
+    location /console/api {
+        proxy_pass http://api:5001;
+        proxy_set_header X-Accel-Buffering no;
+        include proxy.conf;
+    }
+
+    # Proxy paths starting with /api
+    location /api {
+        proxy_pass http://api:5001;
+        include proxy.conf;
+
+        # EventSource support
+        proxy_set_header Connection '';
+        proxy_set_header X-Accel-Buffering no;
+        chunked_transfer_encoding off;
+        proxy_cache off;
+    }
+
+    # Proxy paths starting with /v1
+    location /v1 {
+        proxy_pass http://api:5001;
+        proxy_http_version 1.1;
+        proxy_set_header X-Accel-Buffering no;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Disable proxy buffering
+        proxy_buffering off;
+
+        # EventSource specific settings
+        proxy_set_header Connection '';
+        proxy_read_timeout 86400s;
+    }
+
+    # Proxy paths starting with /files
+    location /files {
+        proxy_pass http://api:5001;
+        include proxy.conf;
+    }
+
+    # Placeholder for ACME challenge location (e.g., Let's Encrypt)
     ${ACME_CHALLENGE_LOCATION}
 
-    # placeholder for https config defined in https.conf.template
+    # Placeholder for HTTPS configuration defined in https.conf.template
     ${HTTPS_CONFIG}
 }

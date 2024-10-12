@@ -44,8 +44,8 @@ x-shared-env: &shared-api-worker-env
   REDIS_DB: 0
   CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://:difyai123456@redis:6379/1}
   BROKER_USE_SSL: ${BROKER_USE_SSL:-false}
-  WEB_API_CORS_ALLOW_ORIGINS: ${WEB_API_CORS_ALLOW_ORIGINS:-*}
-  CONSOLE_CORS_ALLOW_ORIGINS: ${CONSOLE_CORS_ALLOW_ORIGINS:-*}
+  WEB_API_CORS_ALLOW_ORIGINS: '*'
+  CONSOLE_CORS_ALLOW_ORIGINS: '*'
   STORAGE_TYPE: ${STORAGE_TYPE:-local}
   STORAGE_LOCAL_PATH: storage
   VECTOR_STORE: qdrant
@@ -71,6 +71,8 @@ services:
       <<: *shared-api-worker-env
       MODE: api
       QDRANT_URL: http://qdrant:6333
+    ports:
+      - "5001:5001"
     depends_on:
       - db
       - redis
@@ -113,12 +115,31 @@ services:
       - dify_network
 
   ###### Other stuff ######
-  interpreter-py:
+  frontend-react-app:
     build:
-      context: .
-      dockerfile: interpreter-py/Dockerfile.fastapi
+      context: erudite-frontend-react-app
+      dockerfile: Dockerfile
+    volumes:
+      - ./erudite-frontend-react-app:/app
+      - /app/node_modules
     ports:
-      - "8000:8000"
+      - "9998:9998"
+      - "3001:3001"
+    environment:
+      - NODE_ENV=production
+      - REACT_APP_API_URL=/v1
+    networks:
+      - dify_network
+      - default
+    depends_on:
+      - api
+
+  #  interpreter-py:
+  #    build:
+  #      context: .
+  #      dockerfile: interpreter-py/Dockerfile.fastapi
+  #    ports:
+  #      - "8000:8000"
 
   litellm-proxy:
     build:
@@ -164,7 +185,6 @@ services:
       - QDRANT_API_KEY=${QDRANT_API_KEY:-difyai123456}
       - VOYAGE_URL=http://litellm-proxy:4000
       - VOYAGE_API_KEY=${VOYAGE_API_KEY}
-#      - ANOTHER_VOYAGE_API_KEY=${}
     depends_on:
       - qdrant
     ports:
@@ -204,23 +224,23 @@ services:
     healthcheck:
       test: [ "CMD", "redis-cli", "ping" ]
 
-  sandbox:
-    image: langgenius/dify-sandbox:0.2.9
-    restart: always
-    environment:
-      API_KEY: ${SANDBOX_API_KEY:-dify-sandbox}
-      GIN_MODE: ${SANDBOX_GIN_MODE:-release}
-      WORKER_TIMEOUT: ${SANDBOX_WORKER_TIMEOUT:-15}
-      ENABLE_NETWORK: ${SANDBOX_ENABLE_NETWORK:-true}
-      HTTP_PROXY: ${SANDBOX_HTTP_PROXY:-http://ssrf_proxy:3128}
-      HTTPS_PROXY: ${SANDBOX_HTTPS_PROXY:-http://ssrf_proxy:3128}
-      SANDBOX_PORT: ${SANDBOX_PORT:-8194}
-    volumes:
-      - ./volumes/sandbox/dependencies:/dependencies
-    networks:
-      - ssrf_proxy_network
-      - dify_network
-      - default
+  #  sandbox:
+  #    image: langgenius/dify-sandbox:0.2.9
+  #    restart: always
+  #    environment:
+  #      API_KEY: ${SANDBOX_API_KEY:-dify-sandbox}
+  #      GIN_MODE: ${SANDBOX_GIN_MODE:-release}
+  #      WORKER_TIMEOUT: ${SANDBOX_WORKER_TIMEOUT:-15}
+  #      ENABLE_NETWORK: ${SANDBOX_ENABLE_NETWORK:-true}
+  #      HTTP_PROXY: ${SANDBOX_HTTP_PROXY:-http://ssrf_proxy:3128}
+  #      HTTPS_PROXY: ${SANDBOX_HTTPS_PROXY:-http://ssrf_proxy:3128}
+  #      SANDBOX_PORT: ${SANDBOX_PORT:-8194}
+  #    volumes:
+  #      - ./volumes/sandbox/dependencies:/dependencies
+  #    networks:
+  #      - ssrf_proxy_network
+  #      - dify_network
+  #      - default
 
   ssrf_proxy:
     image: ubuntu/squid:latest
@@ -312,5 +332,9 @@ networks:
     internal: true
   dify_network:
     driver: bridge
+    attachable: true
+    internal: false
   default:
     driver: bridge
+    attachable: true
+    internal: false

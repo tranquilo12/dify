@@ -1,13 +1,13 @@
 model_list:
-#  - model_name: claude-3.5-sonnet
-#    litellm_params:
-#      model: anthropic/claude-3-5-sonnet-20240620
-#      api_key: "os.environ/ANTHROPIC_API_KEY" # does os.getenv("AZURE_API_KEY_EU")
-#
-#  - model_name: claude-3-opus
-#    litellm_params:
-#      model: anthropic/claude-3-opus-20240620
-#      api_key: "os.environ/ANTHROPIC_API_KEY" # does os.getenv("AZURE_API_KEY_EU")
+  - model_name: claude-3.5-sonnet
+    litellm_params:
+      model: anthropic/claude-3-5-sonnet-20240620
+      api_key: "os.environ/ANTHROPIC_API_KEY" # does os.getenv("AZURE_API_KEY_EU")
+
+  - model_name: claude-3-opus
+    litellm_params:
+      model: anthropic/claude-3-opus-20240620
+      api_key: "os.environ/ANTHROPIC_API_KEY" # does os.getenv("AZURE_API_KEY_EU")
 
   # These two models are local, and need to be served from LiteLLM to ensure OpenAI compatibility
   - model_name: deepseek-coder-v2

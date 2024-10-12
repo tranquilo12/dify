@@ -30,10 +30,16 @@ export ACME_CHALLENGE_LOCATION
 
 env_vars=$(printenv | cut -d= -f1 | sed 's/^/$/g' | paste -sd, -)
 
+# Process nginx.conf.template
 envsubst "$env_vars" < /etc/nginx/nginx.conf.template > /etc/nginx/nginx.conf
+
+# Process proxy.conf.template
 envsubst "$env_vars" < /etc/nginx/proxy.conf.template > /etc/nginx/proxy.conf
 
-envsubst < /etc/nginx/conf.d/default.conf.template > /etc/nginx/conf.d/default.conf
+# Process default.conf.template
+envsubst "$env_vars" < /etc/nginx/conf.d/default.conf.template > /etc/nginx/conf.d/default.conf.tmp
+envsubst '$HTTPS_CONFIG $ACME_CHALLENGE_LOCATION' < /etc/nginx/conf.d/default.conf.tmp > /etc/nginx/conf.d/default.conf
+rm /etc/nginx/conf.d/default.conf.tmp
 
-# Start Nginx using the default entrypoint
+# Start Nginx
 exec nginx -g 'daemon off;'
