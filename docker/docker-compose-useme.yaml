@@ -117,7 +117,7 @@ services:
   ###### Other stuff ######
   frontend-react-app:
     build:
-      context: erudite-frontend-react-app
+      context: ./erudite-frontend-react-app
       dockerfile: Dockerfile
     volumes:
       - ./erudite-frontend-react-app:/app
@@ -133,6 +133,7 @@ services:
       - default
     depends_on:
       - api
+      - web
 
   #  interpreter-py:
   #    build:
