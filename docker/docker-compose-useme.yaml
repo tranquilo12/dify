@@ -115,33 +115,6 @@ services:
       - dify_network
 
   ###### Other stuff ######
-  frontend-react-app:
-    build:
-      context: ./erudite-frontend-react-app
-      dockerfile: Dockerfile
-    volumes:
-      - ./erudite-frontend-react-app:/app
-      - /app/node_modules
-    ports:
-      - "9998:9998"
-      - "3001:3001"
-    environment:
-      - NODE_ENV=production
-      - REACT_APP_API_URL=/v1
-    networks:
-      - dify_network
-      - default
-    depends_on:
-      - api
-      - web
-
-  #  interpreter-py:
-  #    build:
-  #      context: .
-  #      dockerfile: interpreter-py/Dockerfile.fastapi
-  #    ports:
-  #      - "8000:8000"
-
   litellm-proxy:
     build:
       context: .
@@ -175,12 +148,12 @@ services:
       context: .
       dockerfile: codebase-indexer/Dockerfile.fastapi
     volumes:
-      - ${INTO_THE_DEEP_PATH}:/volumes/IntoTheDeep
+      - ${ERUDITE_PATH}:/volumes/erudite
       - ${OFFICE_ADDON_PATH}:/volumes/officeAddOn
       - ${LLM_STUFF_PATH}:/volumes/LLMStuff
       - ${DIFY_PATH}:/volumes/dify
-      - ./codebase-indexer:/app
-      - indexer-data:/app/data
+      - ./codebase-indexer:/app # This app's codebase.
+      - indexer-data:/app/data # Where the app's data is stored.
     environment:
       - QDRANT_URL=http://qdrant:6333
       - QDRANT_API_KEY=${QDRANT_API_KEY:-difyai123456}

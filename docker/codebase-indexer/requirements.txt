@@ -16,3 +16,8 @@ pandas
 tenacity
 tiktoken
 watchdog
+pytest
+pytest-asyncio
+httpx
+asyncio
+websockets

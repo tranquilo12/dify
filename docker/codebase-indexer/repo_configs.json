@@ -1,6 +1,10 @@
 {
+  "erudite": {
+	"path": "/volumes/erudite",
+	"language": "typescript"
+  },
   "officeAddOn": {
-	"path": "/Users/shriramsunder/Projects/ParationalServices/ParationalAddOn/officeAddOn",
+	"path"    : "/volumes/officeAddOn",
 	"language": "typescript"
   },
   "dify": {

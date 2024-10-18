@@ -1,70 +1,47 @@
 import asyncio
 import os
 import subprocess
+import time
+import traceback
 from contextlib import asynccontextmanager
-from typing import List
+from enum import Enum
+from typing import Dict, List
 
+import httpx
 import uvicorn
-from fastapi import BackgroundTasks, FastAPI, HTTPException
-from fastapi.concurrency import run_in_threadpool
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel, Field
 from qdrant_client import QdrantClient
-from qdrant_client.http import models as qrest
-from qdrant_client.http.exceptions import UnexpectedResponse
 
-from git_operations import GitRepo, save_last_indexed_commit
+from git_operations import (
+    GitRepo, detect_changes, load_last_indexed_commit, save_last_indexed_commit,
+)
 from utils import (
-    get_embeddings, initialize_qdrant, logger, process_repositories, setup_tree_sitter_py, setup_tree_sitter_ts,
-    split_code_chunk, store_chunks_multi,
+    chunk_code_file, ensure_collection_exists, get_embeddings, get_files_to_index, initialize_qdrant, logger,
+    setup_tree_sitter_py, setup_tree_sitter_ts, split_code_chunk, store_chunks_multi,
 )
 
 VECTOR_SIZE = 1024
 
-
-async def check_and_index_repositories():
-    while True:
-        try:
-            logger.info("Starting periodic indexing")
-            await run_in_threadpool(index_codebases)
-            logger.info("Finished periodic indexing")
-        except Exception as e:
-            logger.error(f"Error during periodic indexing: {str(e)}")
-        await asyncio.sleep(300)  # Check every 10 minutes
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    background_tasks = BackgroundTasks()
-    background_tasks.add_task(check_and_index_repositories)
-    logger.info("Started background indexing task")
-    yield
-
-
-app = FastAPI(lifespan=lifespan)
-
 REPO_CONFIGS = {
-    "IntoTheDeep": {
-        "path"    : "/volumes/IntoTheDeep",
-        "language": "python",
-        "parser"  : setup_tree_sitter_py()
+    "erudite"    : {
+        "path"    : "/volumes/erudite",
+        "language": "typescript",
+        "parser"  : setup_tree_sitter_ts()
     },
     "officeAddOn": {
         "path"    : "/volumes/officeAddOn",
         "language": "typescript",
         "parser"  : setup_tree_sitter_ts()
     },
-    "LLMStuff"   : {
-        "path"    : "/volumes/LLMStuff",
-        "language": "python",
-        "parser"  : setup_tree_sitter_py()
-    },
     "dify"       : {
         "path"    : "/volumes/dify",
         "language": "python",
         "parser"  : setup_tree_sitter_py()
     },
-    # Add more repositories as needed
 }
+
+app = FastAPI()
 
 # Initialize components
 qclient: QdrantClient = initialize_qdrant()
@@ -86,22 +63,140 @@ class CommitMsgRequest(BaseModel):
     repo_name: str
 
 
+class IndexingState(str, Enum):
+    NOT_STARTED = "not_started"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class IndexingStatus(BaseModel):
+    status: IndexingState
+    message: str
+    last_updated: float
+
+
+class DetailedIndexingStatus(BaseModel):
+    status: IndexingState
+    message: str
+    last_updated: float
+    files_to_index: List[str] = Field(default_factory=lambda: [])
+    current_file: str = ""
+    processed_files: List[str] = Field(default_factory=lambda: [])
+    total_files: int = 0
+    processed_count: int = 0
+
+    def model_dump(self, **kwargs):
+        data = super().model_dump(**kwargs)
+        data['files_to_index'] = [str(f) for f in data['files_to_index']]
+        data['current_file'] = str(data['current_file'])
+        data['processed_files'] = [str(f) for f in data['processed_files']]
+        return data
+
+
+# Global variable to store detailed indexing status
+detailed_indexing_statuses: Dict[str, DetailedIndexingStatus] = {
+    repo_name: DetailedIndexingStatus(
+        status=IndexingState.NOT_STARTED,
+        message="Indexing not started",
+        last_updated=time.time(),
+        files_to_index=[],
+        current_file="",
+        processed_files=[],
+        total_files=0,
+        processed_count=0
+    )
+    for repo_name in REPO_CONFIGS.keys()
+}
+
+
+async def notify_clients():
+    status_dict = {
+        repo_name: status.model_dump() for repo_name, status in detailed_indexing_statuses.items()
+    }
+    for connection in active_connections:
+        await connection.send_json(status_dict)
+
+
+# WebSocket connections
+active_connections: List[WebSocket] = []
+
+
 def get_git_diff(repo_path: str) -> str:
     try:
-        # Change to the repository directory
         os.chdir(repo_path)
-
-        # Run 'git diff' command
         result = subprocess.run(['git', 'diff'], capture_output=True, text=True, check=True)
-
-        # Return the output
         return result.stdout
     except subprocess.CalledProcessError as e:
-        # If the command fails, return the error message
         return f"Error: {e.stderr}"
     except Exception as e:
-        # For any other exception, return a generic error message
         return f"An error occurred: {str(e)}"
+
+
+@app.get("/repositories")
+async def get_repositories():
+    try:
+        # Assuming all chunks are stored in a collection named "code_chunks"
+        scroll_result = qclient.scroll(
+            collection_name="code_chunks",
+            scroll_filter=None,
+            limit=10000,  # Adjust based on expected number of chunks
+            with_payload=["repository"],
+            with_vectors=False,
+        )
+
+        # Extract unique repository names from the payload
+        repositories = set()
+        for point in scroll_result[0]:
+            if "repository" in point.payload:
+                repositories.add(point.payload["repository"])
+
+        return {"repositories": list(repositories)}
+    except Exception as e:
+        logger.error(f"Error retrieving repositories: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve repositories")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    logger.info("Application startup. WebSocket route registered at /ws")
+    yield
+    # Shutdown
+    logger.info("Application shutdown")
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+async def trigger_indexing(repo_name: str):
+    async with httpx.AsyncClient() as client:
+        response = await client.post(f"http://localhost:7779/index/{repo_name}")
+        return response.json()
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    active_connections.append(websocket)
+    try:
+        while True:
+            data = await websocket.receive_json()
+            if data.get("action") == "index" and "repo_name" in data:
+                repo_name = data["repo_name"]
+                asyncio.create_task(index_repository(repo_name))
+
+            # Send current detailed status immediately after receiving a message
+            await websocket.send_json(
+                {
+                    repo_name: status.model_dump() for repo_name, status in detailed_indexing_statuses.items()
+                }
+            )
+
+            # Wait for a short time before the next update
+            await asyncio.sleep(1)
+    except WebSocketDisconnect:
+        active_connections.remove(websocket)
 
 
 @app.post("/git-diff")
@@ -115,38 +210,88 @@ async def generate_commit_msg(request: CommitMsgRequest):
     if git_diff.startswith("Error:") or git_diff.startswith("An error occurred:"):
         raise HTTPException(status_code=500, detail=git_diff)
 
-    # For now, we'll just return the diff
     return {"diff": git_diff}
 
 
-@app.post("/index")
-async def index_codebases():
+@app.get("/indexing-status/{repo_name}")
+async def get_indexing_status(repo_name: str):
+    if repo_name not in REPO_CONFIGS:
+        raise HTTPException(status_code=400, detail=f"Invalid repository name: {repo_name}")
+    return detailed_indexing_statuses[repo_name]
+
+
+@app.post("/index/{repo_name}", response_model=DetailedIndexingStatus)
+async def index_repository(repo_name: str):
+    if repo_name not in REPO_CONFIGS:
+        raise HTTPException(status_code=400, detail=f"Invalid repository name: {repo_name}")
+
     try:
-        logger.info("Manual indexing triggered")
-        messages = []
-        all_chunks = await process_repositories(REPO_CONFIGS)
-        collection_names = list(all_chunks.keys())
+        config = REPO_CONFIGS[repo_name]
+        repo_path = config['path']
 
-        # Create collection with vector configuration
-        for col in collection_names:
-            try:
-                qclient.create_collection(
-                    collection_name=col,
-                    vectors_config={
-                        'custom_vector': qrest.VectorParams(
-                            distance=qrest.Distance.COSINE,
-                            size=VECTOR_SIZE,
-                        ),
-                    }
-                )
-            except UnexpectedResponse:
-                # Collection already exists, continue
-                pass
+        # Check if directory exists and is accessible
+        if not os.path.isdir(repo_path):
+            raise Exception(f"Repository path does not exist or is not a directory: {repo_path}")
 
-        for collection_name, chunks in all_chunks.items():
+        if not os.access(repo_path, os.R_OK):
+            raise Exception(f"No read permission for repository path: {repo_path}")
+
+        detailed_indexing_statuses[repo_name] = DetailedIndexingStatus(
+            status=IndexingState.IN_PROGRESS,
+            message=f"Indexing started for {repo_name}",
+            last_updated=time.time(),
+            files_to_index=[],
+            current_file="",
+            processed_files=[],
+            total_files=0,
+            processed_count=0
+        )
+        await notify_clients()
+
+        logger.info(f"Indexing repository: {repo_name}")
+        # Check if 'code_chunks' collection exists, create if it doesn't
+        ensure_collection_exists(qclient, "code_chunks", VECTOR_SIZE)
+
+        config = REPO_CONFIGS[repo_name]
+        repo_path = config['path']
+        parser = config['parser']
+
+        git_repo = GitRepo(repo_path)
+        last_indexed_commit = load_last_indexed_commit(repo_path)
+
+        if detect_changes(git_repo, last_indexed_commit):
+            allowed_extensions = ['.py'] if config['language'] == 'python' else ['.js', '.jsx', '.ts', '.tsx']
+            files_to_index = get_files_to_index(git_repo, last_indexed_commit, allowed_extensions)
+            if len(files_to_index) > 100:
+                raise ValueError(f"The number of files is too high: {len(files_to_index)}")
+
+            detailed_indexing_statuses[repo_name].files_to_index = [str(f) for f in files_to_index]
+            detailed_indexing_statuses[repo_name].total_files = len(files_to_index)
+            await notify_clients()
+
+            chunks = []
+            for file_path in files_to_index:
+                try:
+                    detailed_indexing_statuses[repo_name].current_file = str(file_path)
+                    detailed_indexing_statuses[repo_name].last_updated = time.time()
+                    await notify_clients()
+
+                    file_chunks = chunk_code_file(file_path, parser)
+                    chunks.extend(file_chunks)
+
+                    detailed_indexing_statuses[repo_name].processed_files.append(str(file_path))
+                    detailed_indexing_statuses[repo_name].processed_count += 1
+                    await notify_clients()
+                except Exception as e:
+                    logger.error(f"Error processing {file_path}: {str(e)}")
+
             if not chunks:
-                messages.append(f"No new changes to index for collection {collection_name}")
-                continue
+                detailed_indexing_statuses[repo_name].status = IndexingState.COMPLETED
+                detailed_indexing_statuses[repo_name].message = f"No new changes detected for index: {repo_name}"
+                detailed_indexing_statuses[repo_name].last_updated = time.time()
+
+                await notify_clients()
+                return detailed_indexing_statuses[repo_name]
 
             processed_chunks = []
             for chunk in chunks:
@@ -155,139 +300,44 @@ async def index_codebases():
                     processed_chunks.extend(split_chunks)
 
             chunk_contents = [chunk.content for chunk in processed_chunks]
-
             embeddings, _ = get_embeddings(texts=chunk_contents, batch_size=5)
 
             if embeddings:
-                try:
-                    store_chunks_multi(
-                        qclient,
-                        collection_name,
-                        processed_chunks[:len(embeddings)],
-                        embeddings
-                    )
-                    messages.append(f"Collection `{collection_name}` indexed successfully")
-                except Exception as e:
-                    messages.append(f"Error storing embeddings for collection `{collection_name}`: {str(e)}")
-            else:
-                messages.append(f"No embeddings generated for collection `{collection_name}`")
-
-        logger.info("Manual indexing completed")
-        return {"message": messages}
-    except Exception as e:
-        logger.error(f"Error during manual indexing: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/force-index/{repo_name}")
-async def force_index(repo_name: str):
-    try:
-        if repo_name not in REPO_CONFIGS:
-            raise HTTPException(status_code=400, detail=f"Invalid repository name: {repo_name}")
-
-        config = REPO_CONFIGS[repo_name]
-        repo_path = config['path']
-        language = config['language']
-        parser = config['parser']
-
-        git_repo = GitRepo(repo_path)
-
-        # Force re-indexing by setting last_indexed_commit to None
-        all_chunks = await process_repositories({repo_name: config}, force=True)
-
-        messages = []
-        if not all_chunks.get(repo_name):
-            messages.append(f"No chunks to index for repository {repo_name}")
-            return {"message": messages}
-
-        try:
-            # Ensure collection exists
-            try:
-                qclient.create_collection(
-                    collection_name=repo_name,
-                    vectors_config={
-                        'custom_vector': qrest.VectorParams(
-                            distance=qrest.Distance.COSINE,
-                            size=VECTOR_SIZE,
-                        ),
-                    }
-                )
-            except Exception:  # type: ignore
-                # Collection might already exist, continue
-                pass
-
-            processed_chunks = []
-            for chunk in all_chunks[repo_name]:
-                if len(str(chunk.content)) > 0:
-                    split_chunks = split_code_chunk(chunk)
-                    processed_chunks.extend(split_chunks)
-
-            chunk_contents = [chunk.content for chunk in processed_chunks]
-
-            embeddings, _ = get_embeddings(texts=chunk_contents, batch_size=5)
-
-            if embeddings:
-                await store_chunks_multi(
+                store_chunks_multi(
                     qclient,
-                    repo_name,
+                    "code_chunks",
                     processed_chunks[:len(embeddings)],
-                    embeddings
+                    embeddings,
+                    repo_name
                 )
-                messages.append(f"Repository `{repo_name}` indexed successfully")
-
-                # Save the new last indexed commit
                 save_last_indexed_commit(repo_path, git_repo.get_latest_commit())
+                detailed_indexing_statuses[repo_name].status = IndexingState.COMPLETED
+                detailed_indexing_statuses[repo_name].message = f"Repository {repo_name} indexed successfully"
+                detailed_indexing_statuses[repo_name].last_updated = time.time()
+                await notify_clients()
+                return detailed_indexing_statuses[repo_name]
             else:
-                messages.append(f"No embeddings generated for repository `{repo_name}`")
-
-        except Exception as e:
-            messages.append(f"Error indexing repository `{repo_name}`: {str(e)}")
-
-        return {"message": messages}
-    except Exception as e:
-        logger.error(f"Error during force indexing of {repo_name}: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/search", response_model=List[SearchResult])
-async def search(query: Query):
-    results = []
-    if query.collection_name not in REPO_CONFIGS:
-        raise HTTPException(status_code=400, detail="Invalid collection name")
-
-    query_embedding, unprocessed_batches = get_embeddings(query.text)
-    query_vector = qrest.NamedVector(name='custom_vector', vector=query_embedding[0].tolist())
-
-    print(f"{query.collection_name=}")
-
-    search_results = qclient.search(
-        collection_name=query.collection_name,
-        # query_vector=('custom_vector', query_embedding[0].tolist()),  # type: ignore
-        query_vector=query_vector,
-        limit=5,
-        with_payload=True,
-    )
-
-    for hit in search_results:
-        # Add an extra check to ensure the result is from the correct repository
-        if hit.payload["file_path"].startswith(REPO_CONFIGS[query.collection_name]["path"]):
-            results.append(
-                SearchResult(
-                    file_path=hit.payload["file_path"],
-                    code=hit.payload["content"],
-                    chunk_type=hit.payload["chunk_type"],
-                    similarity=hit.score,
-                )
-            )
+                detailed_indexing_statuses[repo_name].status = IndexingState.COMPLETED
+                detailed_indexing_statuses[repo_name].message = f"No embeddings generated for {repo_name}"
+                detailed_indexing_statuses[repo_name].last_updated = time.time()
+                await notify_clients()
+                return detailed_indexing_statuses[repo_name]
         else:
-            print(f"Warning: Filtered out result from unexpected path: {hit.payload['file_path']}")
+            detailed_indexing_statuses[repo_name].status = IndexingState.COMPLETED
+            detailed_indexing_statuses[repo_name].message = f"No changes detected for {repo_name}"
+            detailed_indexing_statuses[repo_name].last_updated = time.time()
 
-    return results
+        await notify_clients()
+        return detailed_indexing_statuses[repo_name]
 
-
-@app.get("/collections")
-async def list_collections():
-    return {"collections": list(REPO_CONFIGS.keys())}
+    except Exception as e:
+        error_trace = traceback.format_exc()
+        logger.error(f"Error during indexing of {repo_name}: {str(e)}\n{error_trace}")
+        detailed_indexing_statuses[repo_name].status = IndexingState.FAILED
+        detailed_indexing_statuses[repo_name].message = f"Error indexing {repo_name}: {str(e)}"
+        detailed_indexing_statuses[repo_name].last_updated = time.time()
+        await notify_clients()
+        return detailed_indexing_statuses[repo_name]
 
 
 if __name__ == "__main__":

@@ -12,13 +12,14 @@ import tree_sitter_python as tspython
 import tree_sitter_typescript as xtypescript
 from dotenv import load_dotenv
 from qdrant_client import QdrantClient
-from qdrant_client.http import models
+from qdrant_client.http import models as qrest
+from qdrant_client.http.exceptions import UnexpectedResponse
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_fixed
 from tqdm import trange
 from tree_sitter import Language, Parser, Point
 
 from git_operations import (
-    GitRepo, detect_changes, get_files_to_index, load_last_indexed_commit, save_last_indexed_commit,
+    GitRepo, detect_changes, load_last_indexed_commit, save_last_indexed_commit,
 )
 from logger import indexer_logger as logger
 
@@ -185,6 +186,26 @@ def is_ignored(path: Path, repo_root: Path, gitignore_spec: Optional[pathspec.Pa
     return False
 
 
+def get_files_to_index(repo: GitRepo, last_indexed_commit: Optional[str], allowed_extensions: List[str]) -> List[Path]:
+    repo_path: Path = get_normalized_path(repo.path)
+    included_files = []
+
+    gitignore_spec = load_gitignore(repo_path)
+
+    for ext in allowed_extensions:
+        for file_path in repo_path.rglob(f"*{ext}"):
+            filename = str(file_path).split("/")[-1]
+            if ("webpack" not in filename) and ("jest" not in filename) and ("ui" not in filename):
+                if not is_ignored(file_path, repo_path, gitignore_spec):
+                    included_files.append(file_path)
+
+    if last_indexed_commit is not None:
+        changed_files = repo.get_changed_files(last_indexed_commit)
+        included_files = [f for f in included_files if f in changed_files]
+
+    return included_files
+
+
 def chunk_code_file(file_path: Path, parser: Parser) -> List[CodeChunk]:
     """
     Chunk a Python file into CodeChunk objects.
@@ -274,7 +295,7 @@ def process_repository_ts(repo_path: Path, parser: Parser) -> List[CodeChunk]:
             if ("webpack" not in filename) and ("jest" not in filename):
                 if not is_ignored(file_path, repo_path, gitignore_spec):
                     try:
-                        chunks = chunk_code_file(str(file_path), parser)
+                        chunks = chunk_code_file(file_path, parser)
                         all_chunks.extend(chunks)
                     except Exception as e:
                         print(f"Error processing {file_path}: {str(e)}")
@@ -383,6 +404,7 @@ def store_chunks_multi(
     collection_name: str,
     chunks: List[CodeChunk],
     embeddings: List[np.ndarray],
+    repository_name: str,
 ):
     """
     Store CodeChunks and their embeddings in Qdrant.
@@ -397,13 +419,15 @@ def store_chunks_multi(
         List of CodeChunk objects to store.
     embeddings : List[np.ndarray]
         List of embedding vectors corresponding to the chunks.
+    repository_name: str
+        Name of the repository these chunks belong to.
     """
 
     # Prepare points for batch insertion
     points = [
-        models.PointStruct(
+        qrest.PointStruct(
             id=i,
-            vector={'custom_vector': embedding.tolist()},
+            vector={'custom_vector': embedding.tolist()},  # Use named vector
             payload={
                 "content"    : chunk.content,
                 "chunk_type" : chunk.chunk_type,
@@ -412,13 +436,59 @@ def store_chunks_multi(
                 "end_byte"   : chunk.end_byte,
                 "start_point": chunk.start_point,
                 "end_point"  : chunk.end_point,
+                "repository" : repository_name,
             },
         )
         for i, (chunk, embedding) in enumerate(zip(chunks, embeddings))
     ]
 
     # Batch insert points
-    batch_size = 100  # Adjust based on your needs and Qdrants capabilities
-    for i in trange(0, len(points), batch_size, desc="To qdrant..."):
+    batch_size = 100  # Adjust based on your needs and Qdrant's capabilities
+    for i in trange(0, len(points), batch_size, desc="Indexing to Qdrant..."):
         batch = points[i: i + batch_size]
         client.upsert(collection_name=collection_name, points=batch)
+
+
+def ensure_collection_exists(qclient: QdrantClient, collection_name: str, vector_size: int):
+    """
+    Ensures that a collection exists in Qdrant. If it doesn't exist, it creates the collection.
+    If it already exists, it logs that information.
+
+    Args:
+    qclient (QdrantClient): The Qdrant client instance
+    collection_name (str): The name of the collection to check/create
+    vector_size (int): The size of the vector for the collection
+
+    Returns:
+    bool: True if the collection was created, False if it already existed
+    """
+    try:
+        collection_exists = qclient.collection_exists(collection_name=collection_name)
+    except UnexpectedResponse as e:
+        if e.status_code == 404:
+            collection_exists = False
+        else:
+            raise
+
+    if not collection_exists:
+        try:
+            qclient.create_collection(
+                collection_name=collection_name,
+                vectors_config={
+                    'custom_vector': qrest.VectorParams(
+                        distance=qrest.Distance.COSINE,
+                        size=vector_size,
+                    ),
+                }
+            )
+            logger.info(f"Created '{collection_name}' collection")
+            return True
+        except UnexpectedResponse as e:
+            if f"Collection `{collection_name}` already exists" in str(e):
+                logger.info(f"'{collection_name}' collection already exists")
+                return False
+            else:
+                raise
+    else:
+        logger.info(f"'{collection_name}' collection already exists")
+        return False

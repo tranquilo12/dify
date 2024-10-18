@@ -33,16 +33,6 @@ server {
       include proxy.conf;
     }
 
-    location /new {
-      proxy_pass http://frontend-react-app:9998;
-      include proxy.conf;
-    }
-
-    location /ws {
-      proxy_pass http://frontend-react-app:9998;
-      include proxy.conf;
-    }
-
     # placeholder for acme challenge location
     ${ACME_CHALLENGE_LOCATION}
 
