@@ -21,3 +21,4 @@ pytest-asyncio
 httpx
 asyncio
 websockets
+python-socketio

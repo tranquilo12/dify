@@ -150,7 +150,6 @@ services:
     volumes:
       - ${ERUDITE_PATH}:/volumes/erudite
       - ${OFFICE_ADDON_PATH}:/volumes/officeAddOn
-      - ${LLM_STUFF_PATH}:/volumes/LLMStuff
       - ${DIFY_PATH}:/volumes/dify
       - ./codebase-indexer:/app # This app's codebase.
       - indexer-data:/app/data # Where the app's data is stored.
