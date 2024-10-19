@@ -8,10 +8,11 @@ from typing import Dict, List, Optional
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from qdrant_client import QdrantClient
+from socketio import ASGIApp, AsyncServer
 
 from git_operations import (
     GitRepo, detect_changes, load_last_indexed_commit, save_last_indexed_commit,
@@ -131,7 +132,7 @@ def get_git_diff(repo_path: str) -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    logger.info("Application startup. WebSocket route registered at /ws")
+    logger.info("Application startup. Socket.IO server initialized.")
     yield
     # Shutdown
     logger.info("Application shutdown")
@@ -143,35 +144,150 @@ async def trigger_indexing(repo_name: str):
         return response.json()
 
 
-# WebSocket connections
-active_connections: List[WebSocket] = []
+# Initialize Socket.IO server
+sio = AsyncServer(async_mode='asgi', cors_allowed_origins='*')
 
 # Configure CORS after instantiating app
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(
-    CORSMiddleware,  # type: ignore
-    allow_origins=["*"],  # Allows all origins
+    CORSMiddleware,
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
+# Mount Socket.IO app
+socket_app = ASGIApp(sio, app)
+app.mount("/socket.io", socket_app)
 
-@app.websocket("/indexer")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    active_connections.append(websocket)
+
+@sio.event
+async def connect(sid, environ):
+    logger.info(f"Client connected: {sid}")
+
+
+@sio.event
+async def disconnect(sid):
+    logger.info(f"Client disconnected: {sid}")
+
+
+@sio.event
+async def index_repository(sid, data):
+    repo_name = data.get('repo_name')
+    if repo_name not in REPO_CONFIGS:
+        await sio.emit('error', {'message': f"Invalid repository name: {repo_name}"}, room=sid)
+        return
+
     try:
-        while True:
-            data = await websocket.receive_json()
-            if data.get("action") == "index":
-                await index_repository(websocket, data)
-            # TODO: Add endpoints for both refreshing and deleting the index
-    except WebSocketDisconnect:
-        active_connections.remove(websocket)
+        config = REPO_CONFIGS[repo_name]
+        repo_path = config['path']
+
+        # Check if directory exists and is accessible
+        if not os.path.isdir(repo_path):
+            raise Exception(f"Repository path does not exist or is not a directory: {repo_path}")
+
+        if not os.access(repo_path, os.R_OK):
+            raise Exception(f"No read permission for repository path: {repo_path}")
+
+        detailed_indexing_statuses[repo_name] = DetailedIndexingStatus(
+            status=IndexingState.IN_PROGRESS,
+            message=f"Indexing started for {repo_name}",
+            last_updated=time.time(),
+            files_to_index=[],
+            current_file="",
+            processed_files=[],
+            total_files=0,
+            processed_count=0
+        )
+        await sio.emit('indexing_status', detailed_indexing_statuses[repo_name].model_dump(), room=sid)
+
+        # Check if 'code_chunks' collection exists, create if it doesn't
+        logger.info(f"Indexing repository: {repo_name}")
+        ensure_collection_exists(qclient, "code_chunks", VECTOR_SIZE)
+
+        config = REPO_CONFIGS[repo_name]
+        repo_path = config['path']
+        parser = config['parser']
+
+        git_repo = GitRepo(repo_path)
+        last_indexed_commit = load_last_indexed_commit(repo_path)
+
+        if detect_changes(git_repo, last_indexed_commit):
+            allowed_extensions = ['.py'] if config['language'] == 'python' else ['.js', '.jsx', '.ts', '.tsx']
+            files_to_index = get_files_to_index(git_repo, last_indexed_commit, allowed_extensions)
+            if len(files_to_index) > 100:
+                raise ValueError(f"The number of files is too high: {len(files_to_index)}")
+
+            detailed_indexing_statuses[repo_name].files_to_index = [str(f) for f in files_to_index]
+            detailed_indexing_statuses[repo_name].total_files = len(files_to_index)
+            await sio.emit('indexing_status', detailed_indexing_statuses[repo_name].model_dump(), room=sid)
+
+            chunks = []
+            for file_path in files_to_index:
+                try:
+                    detailed_indexing_statuses[repo_name].current_file = str(file_path)
+                    detailed_indexing_statuses[repo_name].last_updated = time.time()
+                    await sio.emit('indexing_status', detailed_indexing_statuses[repo_name].model_dump(), room=sid)
+
+                    file_chunks = chunk_code_file(file_path, parser)
+                    chunks.extend(file_chunks)
+
+                    detailed_indexing_statuses[repo_name].processed_files.append(str(file_path))
+                    detailed_indexing_statuses[repo_name].processed_count += 1
+                    await sio.emit('indexing_status', detailed_indexing_statuses[repo_name].model_dump(), room=sid)
+                except Exception as e:
+                    logger.error(f"Error processing {file_path}: {str(e)}")
+
+            if not chunks:
+                detailed_indexing_statuses[repo_name].status = IndexingState.COMPLETED
+                detailed_indexing_statuses[repo_name].message = f"No new changes detected for index: {repo_name}"
+                detailed_indexing_statuses[repo_name].last_updated = time.time()
+                await sio.emit('indexing_status', detailed_indexing_statuses[repo_name].model_dump(), room=sid)
+
+            processed_chunks = []
+            for chunk in chunks:
+                if len(str(chunk.content)) > 0:
+                    split_chunks = split_code_chunk(chunk)
+                    processed_chunks.extend(split_chunks)
+
+            chunk_contents = [chunk.content for chunk in processed_chunks]
+            embeddings, _ = get_embeddings(texts=chunk_contents, batch_size=5)
+
+            if embeddings:
+                store_chunks_multi(
+                    qclient,
+                    "code_chunks",
+                    processed_chunks[:len(embeddings)],
+                    embeddings,
+                    repo_name
+                )
+                save_last_indexed_commit(repo_path, git_repo.get_latest_commit())
+                detailed_indexing_statuses[repo_name].status = IndexingState.COMPLETED
+                detailed_indexing_statuses[repo_name].message = f"Repository {repo_name} indexed successfully"
+                detailed_indexing_statuses[repo_name].last_updated = time.time()
+            else:
+                detailed_indexing_statuses[repo_name].status = IndexingState.COMPLETED
+                detailed_indexing_statuses[repo_name].message = f"No embeddings generated for {repo_name}"
+                detailed_indexing_statuses[repo_name].last_updated = time.time()
+
+            await sio.emit('indexing_status', detailed_indexing_statuses[repo_name].model_dump(), room=sid)
+        else:
+            detailed_indexing_statuses[repo_name].status = IndexingState.COMPLETED
+            detailed_indexing_statuses[repo_name].message = f"No changes detected for {repo_name}"
+            detailed_indexing_statuses[repo_name].last_updated = time.time()
+
+        await sio.emit('indexing_status', detailed_indexing_statuses[repo_name].model_dump(), room=sid)
+
+    except Exception as e:
+        error_trace = traceback.format_exc()
+        logger.error(f"Error during indexing of {repo_name}: {str(e)}\n{error_trace}")
+        detailed_indexing_statuses[repo_name].status = IndexingState.FAILED
+        detailed_indexing_statuses[repo_name].message = f"Error indexing {repo_name}: {str(e)}"
+        detailed_indexing_statuses[repo_name].last_updated = time.time()
+        await sio.emit('indexing_status', detailed_indexing_statuses[repo_name].model_dump(), room=sid)
 
 
-# Everything related to the endpoints
 @app.get("/repos-in-qdrant")
 async def get_repos_in_qdrant():
     try:
@@ -252,120 +368,5 @@ async def get_indexing_status(repo_name: str):
     return detailed_indexing_statuses[repo_name]
 
 
-async def index_repository(websocket: WebSocket, data: dict):
-    repo_name = data.get('repo_name')
-    if repo_name not in REPO_CONFIGS:
-        await websocket.send_json({'error': f"Invalid repository name: {repo_name}"})
-        return
-
-    try:
-        config = REPO_CONFIGS[repo_name]
-        repo_path = config['path']
-
-        # Check if directory exists and is accessible
-        if not os.path.isdir(repo_path):
-            raise Exception(f"Repository path does not exist or is not a directory: {repo_path}")
-
-        if not os.access(repo_path, os.R_OK):
-            raise Exception(f"No read permission for repository path: {repo_path}")
-
-        detailed_indexing_statuses[repo_name] = DetailedIndexingStatus(
-            status=IndexingState.IN_PROGRESS,
-            message=f"Indexing started for {repo_name}",
-            last_updated=time.time(),
-            files_to_index=[],
-            current_file="",
-            processed_files=[],
-            total_files=0,
-            processed_count=0
-        )
-        await websocket.send_json({'indexing_status': detailed_indexing_statuses[repo_name].model_dump()})
-
-        # Check if 'code_chunks' collection exists, create if it doesn't
-        logger.info(f"Indexing repository: {repo_name}")
-        ensure_collection_exists(qclient, "code_chunks", VECTOR_SIZE)
-
-        config = REPO_CONFIGS[repo_name]
-        repo_path = config['path']
-        parser = config['parser']
-
-        git_repo = GitRepo(repo_path)
-        last_indexed_commit = load_last_indexed_commit(repo_path)
-
-        if detect_changes(git_repo, last_indexed_commit):
-            allowed_extensions = ['.py'] if config['language'] == 'python' else ['.js', '.jsx', '.ts', '.tsx']
-            files_to_index = get_files_to_index(git_repo, last_indexed_commit, allowed_extensions)
-            if len(files_to_index) > 100:
-                raise ValueError(f"The number of files is too high: {len(files_to_index)}")
-
-            detailed_indexing_statuses[repo_name].files_to_index = [str(f) for f in files_to_index]
-            detailed_indexing_statuses[repo_name].total_files = len(files_to_index)
-            await websocket.send_json({'indexing_status': detailed_indexing_statuses[repo_name].model_dump()})
-
-            chunks = []
-            for file_path in files_to_index:
-                try:
-                    detailed_indexing_statuses[repo_name].current_file = str(file_path)
-                    detailed_indexing_statuses[repo_name].last_updated = time.time()
-                    await websocket.send_json({'indexing_status': detailed_indexing_statuses[repo_name].model_dump()})
-
-                    file_chunks = chunk_code_file(file_path, parser)
-                    chunks.extend(file_chunks)
-
-                    detailed_indexing_statuses[repo_name].processed_files.append(str(file_path))
-                    detailed_indexing_statuses[repo_name].processed_count += 1
-                    await websocket.send_json({'indexing_status': detailed_indexing_statuses[repo_name].model_dump()})
-                except Exception as e:
-                    logger.error(f"Error processing {file_path}: {str(e)}")
-
-            if not chunks:
-                detailed_indexing_statuses[repo_name].status = IndexingState.COMPLETED
-                detailed_indexing_statuses[repo_name].message = f"No new changes detected for index: {repo_name}"
-                detailed_indexing_statuses[repo_name].last_updated = time.time()
-                await websocket.send_json({'indexing_status': detailed_indexing_statuses[repo_name].model_dump()})
-
-            processed_chunks = []
-            for chunk in chunks:
-                if len(str(chunk.content)) > 0:
-                    split_chunks = split_code_chunk(chunk)
-                    processed_chunks.extend(split_chunks)
-
-            chunk_contents = [chunk.content for chunk in processed_chunks]
-            embeddings, _ = get_embeddings(texts=chunk_contents, batch_size=5)
-
-            if embeddings:
-                store_chunks_multi(
-                    qclient,
-                    "code_chunks",
-                    processed_chunks[:len(embeddings)],
-                    embeddings,
-                    repo_name
-                )
-                save_last_indexed_commit(repo_path, git_repo.get_latest_commit())
-                detailed_indexing_statuses[repo_name].status = IndexingState.COMPLETED
-                detailed_indexing_statuses[repo_name].message = f"Repository {repo_name} indexed successfully"
-                detailed_indexing_statuses[repo_name].last_updated = time.time()
-            else:
-                detailed_indexing_statuses[repo_name].status = IndexingState.COMPLETED
-                detailed_indexing_statuses[repo_name].message = f"No embeddings generated for {repo_name}"
-                detailed_indexing_statuses[repo_name].last_updated = time.time()
-
-            await websocket.send_json({'indexing_status': detailed_indexing_statuses[repo_name].model_dump()})
-        else:
-            detailed_indexing_statuses[repo_name].status = IndexingState.COMPLETED
-            detailed_indexing_statuses[repo_name].message = f"No changes detected for {repo_name}"
-            detailed_indexing_statuses[repo_name].last_updated = time.time()
-
-        await websocket.send_json({'indexing_status': detailed_indexing_statuses[repo_name].model_dump()})
-
-    except Exception as e:
-        error_trace = traceback.format_exc()
-        logger.error(f"Error during indexing of {repo_name}: {str(e)}\n{error_trace}")
-        detailed_indexing_statuses[repo_name].status = IndexingState.FAILED
-        detailed_indexing_statuses[repo_name].message = f"Error indexing {repo_name}: {str(e)}"
-        detailed_indexing_statuses[repo_name].last_updated = time.time()
-        await websocket.send_json({'indexing_status': detailed_indexing_statuses[repo_name].model_dump()})
-
-
 if __name__ == "__main__":
-    uvicorn.run("app:app", host="0.0.0.0", port=7779)
+    uvicorn.run("app:socket_app", host="0.0.0.0", port=7779)
