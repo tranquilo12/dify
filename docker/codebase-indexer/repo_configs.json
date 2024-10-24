@@ -8,7 +8,7 @@
 	"language": "typescript"
   },
   "dify": {
-	"path": "/volumes/dify",
+	"path": "/volumes/dify/docker",
 	"language": "python"
   }
 }

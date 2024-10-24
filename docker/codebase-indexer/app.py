@@ -1,3 +1,4 @@
+import asyncio
 import os
 import subprocess
 import time
@@ -6,13 +7,12 @@ from contextlib import asynccontextmanager
 from enum import Enum
 from typing import Dict, List, Optional
 
-import httpx
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from qdrant_client import QdrantClient
-from socketio import ASGIApp, AsyncServer
+from sse_starlette.sse import EventSourceResponse
 
 from git_operations import (
     GitRepo, detect_changes, load_last_indexed_commit, save_last_indexed_commit,
@@ -132,20 +132,11 @@ def get_git_diff(repo_path: str) -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    logger.info("Application startup. Socket.IO server initialized.")
+    logger.info("Application startup.")
     yield
     # Shutdown
     logger.info("Application shutdown")
 
-
-async def trigger_indexing(repo_name: str):
-    async with httpx.AsyncClient() as client:
-        response = await client.post(f"http://localhost:7779/index/{repo_name}")
-        return response.json()
-
-
-# Initialize Socket.IO server
-sio = AsyncServer(async_mode='asgi', cors_allowed_origins='*')
 
 # Configure CORS after instantiating app
 app = FastAPI(lifespan=lifespan)
@@ -157,27 +148,31 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount Socket.IO app
-socket_app = ASGIApp(sio, app)
-app.mount("/socket.io", socket_app)
+
+@app.get("/sse")
+async def sse(request: Request):
+    async def event_generator():
+        while True:
+            if await request.is_disconnected():
+                break
+
+            # Check for any updates in indexing status
+            for repo_name, status in detailed_indexing_statuses.items():
+                if status.status == IndexingState.IN_PROGRESS:
+                    yield {
+                        "event": "indexing_status",
+                        "data" : status.model_dump()
+                    }
+
+            await asyncio.sleep(1)
+
+    return EventSourceResponse(event_generator())
 
 
-@sio.event
-async def connect(sid, environ):
-    logger.info(f"Client connected: {sid}")
-
-
-@sio.event
-async def disconnect(sid):
-    logger.info(f"Client disconnected: {sid}")
-
-
-@sio.event
-async def index_repository(sid, data):
-    repo_name = data.get('repo_name')
+@app.post("/index/{repo_name}")
+async def index_repository(repo_name: str):
     if repo_name not in REPO_CONFIGS:
-        await sio.emit('error', {'message': f"Invalid repository name: {repo_name}"}, room=sid)
-        return
+        return {"error": f"Invalid repository name: {repo_name}"}
 
     try:
         config = REPO_CONFIGS[repo_name]
@@ -200,20 +195,34 @@ async def index_repository(sid, data):
             total_files=0,
             processed_count=0
         )
-        await sio.emit('indexing_status', detailed_indexing_statuses[repo_name].model_dump(), room=sid)
 
-        # Check if 'code_chunks' collection exists, create if it doesn't
-        logger.info(f"Indexing repository: {repo_name}")
-        ensure_collection_exists(qclient, "code_chunks", VECTOR_SIZE)
+        # Start indexing process (you may want to run this in a background task)
+        await perform_indexing(repo_name)
 
+        return {"message": f"Indexing started for {repo_name}"}
+    except Exception as e:
+        error_trace = traceback.format_exc()
+        logger.error(f"Error during indexing of {repo_name}: {str(e)}\n{error_trace}")
+        detailed_indexing_statuses[repo_name].status = IndexingState.FAILED
+        detailed_indexing_statuses[repo_name].message = f"Error indexing {repo_name}: {str(e)}"
+        detailed_indexing_statuses[repo_name].last_updated = time.time()
+        return {"error": str(e)}
+
+
+async def perform_indexing(repo_name: str):
+    try:
         config = REPO_CONFIGS[repo_name]
         repo_path = config['path']
         parser = config['parser']
+
+        logger.info(f"Indexing repository: {repo_name}")
+        ensure_collection_exists(qclient, "code_chunks", VECTOR_SIZE)
 
         git_repo = GitRepo(repo_path)
         last_indexed_commit = load_last_indexed_commit(repo_path)
 
         if detect_changes(git_repo, last_indexed_commit):
+            print(f"{config['language']=}")
             allowed_extensions = ['.py'] if config['language'] == 'python' else ['.js', '.jsx', '.ts', '.tsx']
             files_to_index = get_files_to_index(git_repo, last_indexed_commit, allowed_extensions)
             if len(files_to_index) > 100:
@@ -221,21 +230,18 @@ async def index_repository(sid, data):
 
             detailed_indexing_statuses[repo_name].files_to_index = [str(f) for f in files_to_index]
             detailed_indexing_statuses[repo_name].total_files = len(files_to_index)
-            await sio.emit('indexing_status', detailed_indexing_statuses[repo_name].model_dump(), room=sid)
 
             chunks = []
             for file_path in files_to_index:
                 try:
                     detailed_indexing_statuses[repo_name].current_file = str(file_path)
                     detailed_indexing_statuses[repo_name].last_updated = time.time()
-                    await sio.emit('indexing_status', detailed_indexing_statuses[repo_name].model_dump(), room=sid)
 
                     file_chunks = chunk_code_file(file_path, parser)
                     chunks.extend(file_chunks)
 
                     detailed_indexing_statuses[repo_name].processed_files.append(str(file_path))
                     detailed_indexing_statuses[repo_name].processed_count += 1
-                    await sio.emit('indexing_status', detailed_indexing_statuses[repo_name].model_dump(), room=sid)
                 except Exception as e:
                     logger.error(f"Error processing {file_path}: {str(e)}")
 
@@ -243,7 +249,7 @@ async def index_repository(sid, data):
                 detailed_indexing_statuses[repo_name].status = IndexingState.COMPLETED
                 detailed_indexing_statuses[repo_name].message = f"No new changes detected for index: {repo_name}"
                 detailed_indexing_statuses[repo_name].last_updated = time.time()
-                await sio.emit('indexing_status', detailed_indexing_statuses[repo_name].model_dump(), room=sid)
+                return
 
             processed_chunks = []
             for chunk in chunks:
@@ -270,14 +276,10 @@ async def index_repository(sid, data):
                 detailed_indexing_statuses[repo_name].status = IndexingState.COMPLETED
                 detailed_indexing_statuses[repo_name].message = f"No embeddings generated for {repo_name}"
                 detailed_indexing_statuses[repo_name].last_updated = time.time()
-
-            await sio.emit('indexing_status', detailed_indexing_statuses[repo_name].model_dump(), room=sid)
         else:
             detailed_indexing_statuses[repo_name].status = IndexingState.COMPLETED
             detailed_indexing_statuses[repo_name].message = f"No changes detected for {repo_name}"
             detailed_indexing_statuses[repo_name].last_updated = time.time()
-
-        await sio.emit('indexing_status', detailed_indexing_statuses[repo_name].model_dump(), room=sid)
 
     except Exception as e:
         error_trace = traceback.format_exc()
@@ -285,7 +287,6 @@ async def index_repository(sid, data):
         detailed_indexing_statuses[repo_name].status = IndexingState.FAILED
         detailed_indexing_statuses[repo_name].message = f"Error indexing {repo_name}: {str(e)}"
         detailed_indexing_statuses[repo_name].last_updated = time.time()
-        await sio.emit('indexing_status', detailed_indexing_statuses[repo_name].model_dump(), room=sid)
 
 
 @app.get("/repos-in-qdrant")
@@ -369,4 +370,4 @@ async def get_indexing_status(repo_name: str):
 
 
 if __name__ == "__main__":
-    uvicorn.run("app:socket_app", host="0.0.0.0", port=7779)
+    uvicorn.run("app:app", host="0.0.0.0", port=7779)

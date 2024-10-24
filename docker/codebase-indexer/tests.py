@@ -23,5 +23,5 @@ def print_file_paths(path: str):
 if __name__ == "__main__":
     # p = "/Users/shriramsunder/Projects/ParationalServices/ParationalAddOn/officeAddOn"
     # p = "/volumes/dify/docker"
-    p = "/volumes/erudite"
+    p = "/volumes/dify"
     print_file_paths(p)
